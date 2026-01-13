@@ -81,7 +81,8 @@ PLATFORMS = {
         "name": "百家号",
         "code": "BJH",
         "login_url": "https://baijiahao.baidu.com/builder/rc/static/login/index",
-        "publish_url": "https://baijiahao.baidu.com/builder/rc/edit/index",
+        "home_url": "https://baijiahao.baidu.com/builder/rc/static/edit/index",  # 百家号首页（作者中心）
+        "publish_url": "https://baijiahao.baidu.com/builder/rc/edit/index",  # 编辑器首页
         "color": "#E53935",
     },
     "sohu": {

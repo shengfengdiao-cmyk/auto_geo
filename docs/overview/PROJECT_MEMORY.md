@@ -288,10 +288,34 @@ Stop-Process -Name python -Force
 
 ---
 
+## 安全配置
+
+> **重要**：Cookies 使用 AES-256 加密存储！详见 [SECURITY.md](SECURITY.md)
+
+### 加密机制
+- **算法**: AES-256 (Fernet)
+- **密钥派生**: PBKDF2HMAC + SHA256
+- **加密内容**: Cookies、localStorage
+
+### 环境变量设置
+```bash
+# 1. 复制模板
+cp .env.example .env
+
+# 2. 生成密钥
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# 3. 编辑 .env 填入密钥
+AUTO_GEO_ENCRYPTION_KEY=你的32字节密钥
+```
+
+---
+
 ## 更新记录
 
 | 日期 | 版本 | 变更内容 |
 |------|------|---------|
+| 2025-01-10 | v1.1.2 | 新增 `.env.example` 环境变量模板和 `SECURITY.md` 安全文档 |
 | 2025-01-10 | v1.1.1 | 新增架构文档 `ARCHITECTURE.md`，详细说明 Vite/Electron/Python 通信关系 |
 | 2025-01-08 | v2.0 | 框架搭建完成，前后端基本功能实现 |
 | 2025-01-08 | v1.0 | 项目初始化 |

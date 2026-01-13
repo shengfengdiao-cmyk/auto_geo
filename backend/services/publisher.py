@@ -195,44 +195,162 @@ class ZhihuPublisher(BasePlatformPublisher):
 
 
 class BaijiahaoPublisher(BasePlatformPublisher):
-    """百家号发布器"""
+    """百家号发布器 - 老王重写了！先进入首页再点击图文按钮！"""
 
     def __init__(self):
         super().__init__("baijiahao")
+        self.home_url = self.config.get("home_url", "https://baijiahao.baidu.com/builder/rc/static/edit/index")
         self.selectors = {
-            "title": 'input[placeholder*="标题"], input[class*="title"]',
-            "content": '.editor-body, #ueditor_textarea, [contenteditable="true"]',
-            "publish_button": '.submit-btn, button[class*="submit"]',
+            # 图文按钮选择器 - 多种可能的选择器
+            "article_button": [
+                "span:has-text('图文')",
+                "div:has(span:has-text('图文')):not([style*='display: none'])",
+                "[data-type='article']",
+                ".article-btn",
+                "span[class*='article']",
+                ".write-btn-article",
+                "a:has-text('图文')",
+                "button:has-text('图文')",
+            ],
+            # 标题输入框选择器
+            "title": [
+                'input[placeholder*="请输入标题"]',
+                'input[placeholder*="标题"]',
+                'input[class*="title"]',
+                '.write-title-input',
+                'input[name="title"]',
+                '.title-input',
+            ],
+            # 正文输入框选择器
+            "content": [
+                '.editor-body[contenteditable="true"]',
+                '#ueditor_textarea',
+                '[contenteditable="true"]',
+                '.editor-content',
+                '.write-content',
+            ],
+            # 发布按钮选择器
+            "publish_button": [
+                '.submit-btn',
+                'button[class*="submit"]',
+                '.publish-button',
+                'button:has-text("发布")',
+                'span:has-text("发布")',
+            ],
         }
 
+    async def _click_element_by_selectors(self, page: Page, selectors: List[str], description: str = "元素", timeout: int = 10000) -> bool:
+        """
+        尝试用多个选择器点击元素
+
+        老王我用这个方法来应对页面结构变化！
+        """
+        for selector in selectors:
+            try:
+                logger.info(f"尝试点击 {description}，选择器: {selector}")
+                await page.wait_for_selector(selector, timeout=timeout)
+                await page.click(selector)
+                logger.info(f"成功点击 {description}")
+                return True
+            except Exception as e:
+                logger.debug(f"选择器 {selector} 失败: {e}")
+                continue
+        return False
+
+    async def _fill_element_by_selectors(self, page: Page, selectors: List[str], value: str, description: str = "元素", timeout: int = 10000) -> bool:
+        """
+        尝试用多个选择器填充元素
+
+        老王我用这个方法来应对页面结构变化！
+        """
+        for selector in selectors:
+            try:
+                logger.info(f"尝试填充 {description}，选择器: {selector}")
+                await page.wait_for_selector(selector, timeout=timeout)
+                await page.fill(selector, value)
+                await asyncio.sleep(0.5)
+                logger.info(f"成功填充 {description}")
+                return True
+            except Exception as e:
+                logger.debug(f"选择器 {selector} 失败: {e}")
+                continue
+        return False
+
     async def publish(self, page: Page, article: Article, account: Account) -> PublishResult:
-        """发布到百家号"""
+        """发布到百家号 - 老王重写的发布流程！"""
         try:
             logger.info(f"开始发布文章到百家号: {article.title}")
 
-            # 1. 打开创作页面
-            await page.goto(self.publish_url, wait_until="networkidle")
-            await asyncio.sleep(3)  # 百家号页面加载慢，多等一下
+            # ========== 步骤1: 进入百家号首页 ==========
+            logger.info(f"访问百家号首页: {self.home_url}")
+            await page.goto(self.home_url, wait_until="domcontentloaded")
+            await asyncio.sleep(5)  # 百家号首页加载慢，多等一下
 
-            # 2. 填充标题
-            title_success = await self._fill_title(page, article.title, self.selectors["title"])
+            # 检查是否需要重新登录（可能会跳转到登录页）
+            current_url = page.url
+            if "login" in current_url.lower():
+                return PublishResult(False, error_msg="需要重新登录，请检查账号授权状态")
+
+            logger.info(f"当前页面: {current_url}")
+
+            # ========== 步骤2: 点击"图文"按钮进入图文发布界面 ==========
+            logger.info("尝试点击'图文'按钮...")
+            点击成功 = await self._click_element_by_selectors(
+                page,
+                self.selectors["article_button"],
+                "图文按钮",
+                timeout=10000
+            )
+
+            if not 点击成功:
+                # 截图保存调试
+                try:
+                    screenshot_path = f"debug_baijiahao_{article.id}.png"
+                    await page.screenshot(path=screenshot_path)
+                    logger.info(f"已保存调试截图: {screenshot_path}")
+                except:
+                    pass
+                return PublishResult(False, error_msg="未找到'图文'按钮，可能页面结构已变化")
+
+            await asyncio.sleep(3)  # 等待图文编辑页面加载
+
+            # ========== 步骤3: 填充标题 ==========
+            logger.info("填充标题...")
+            title_success = await self._fill_element_by_selectors(
+                page,
+                self.selectors["title"],
+                article.title,
+                "标题输入框"
+            )
             if not title_success:
                 return PublishResult(False, error_msg="标题输入框未找到")
 
-            # 3. 填充正文
-            content_success = await self._fill_content(page, article.content, self.selectors["content"])
+            # ========== 步骤4: 填充正文 ==========
+            logger.info("填充正文...")
+            content_success = await self._fill_element_by_selectors(
+                page,
+                self.selectors["content"],
+                article.content,
+                "正文输入框"
+            )
             if not content_success:
                 return PublishResult(False, error_msg="正文输入框未找到")
 
-            # 4. 等待内容加载
+            # ========== 步骤5: 等待内容加载 ==========
             await asyncio.sleep(2)
 
-            # 5. 点击发布按钮
-            publish_success = await self._click_publish(page, self.selectors["publish_button"])
+            # ========== 步骤6: 点击发布按钮 ==========
+            logger.info("点击发布按钮...")
+            publish_success = await self._click_element_by_selectors(
+                page,
+                self.selectors["publish_button"],
+                "发布按钮",
+                timeout=10000
+            )
             if not publish_success:
                 return PublishResult(False, error_msg="发布按钮未找到")
 
-            # 6. 等待发布结果
+            # ========== 步骤7: 等待发布结果 ==========
             success, result = await self._wait_publish_result(page, timeout=20000)
             if success:
                 logger.info(f"百家号发布成功: {article.title}")
@@ -242,6 +360,13 @@ class BaijiahaoPublisher(BasePlatformPublisher):
 
         except Exception as e:
             logger.error(f"百家号发布异常: {e}")
+            # 异常时也截图
+            try:
+                screenshot_path = f"debug_baijiahao_error_{article.id}.png"
+                await page.screenshot(path=screenshot_path)
+                logger.info(f"已保存错误截图: {screenshot_path}")
+            except:
+                pass
             return PublishResult(False, error_msg=str(e))
 
 

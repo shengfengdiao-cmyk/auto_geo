@@ -47,6 +47,15 @@ backend/database/*.sqlite
 browser_context/
 user_data/
 
+# ==================== Playwright storage_state ====================
+*_state.json
+*storage_state*.json
+baijiahao_login.json
+n# ==================== Playwright storage_state ====================
+*_state.json
+*storage_state*.json
+baijiahao_login.json
+
 # ==================== Node.js / 前端 ====================
 node_modules/
 npm-debug.log*
@@ -67,14 +76,16 @@ dist-electron/
 *.sublime-*
 
 # ==================== 测试脚本（临时文件）====================
+test/
 decode.py
 decode_state.js
 kill_processes.py
-test_port.py
 login_demo.py
-check_playwright.js
 cookie_login_test.py
 cookie_demo_screenshot.png
+
+# ==================== 项目文档（如果需要忽略）====================
+# docs/
 
 # ==================== 日志文件 ====================
 logs/
