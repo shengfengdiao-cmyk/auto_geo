@@ -1,247 +1,142 @@
 # -*- coding: utf-8 -*-
 """
-定时任务API
-管理收录检测、文章生成及发布任务的定时配置与手动触发！
+定时任务API中心
+对接前端控制面板，支持立即执行、配置保存和排期查询。
 """
 
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
-from backend.database import get_db
+# 导入业务服务层
 from backend.services.scheduler_service import get_scheduler_service
+from backend.database import get_db
 from backend.schemas import ApiResponse
 from loguru import logger
 
-router = APIRouter(prefix="/api/scheduler", tags=["定时任务"])
+router = APIRouter(prefix="/api/scheduler", tags=["定时任务中心"])
 
 
-# ==================== 响应与请求模型 (满足输入输出一致性) ====================
+# ==================== 数据模型 (匹配前端UI需求) ====================
 
 class JobInfo(BaseModel):
-    """任务运行信息"""
+    """用于展示给前端的任务排期信息"""
     id: str
     name: str
-    next_run_time: str | None
+    next_run: Optional[str] = None  # 统一使用 next_run
+    params: Optional[str] = None
 
 
-class JobConfig(BaseModel):
-    """任务配置模型"""
-    enabled: bool = Field(..., description="是否启用")
-    schedule_type: str = Field(..., description="调度类型: daily, interval, weekdays")
-    time: str = Field(..., description="执行时间 HH:mm")
-    project_id: Optional[int] = None
-    count: Optional[int] = Field(5, description="每次生成的数量")
-    platforms: Optional[List[str]] = ["zhihu"]
-    concurrency: Optional[int] = 3
+class TaskConfigPayload(BaseModel):
+    """适配 UI 上的配置卡片数据包"""
+    enabled: bool = Field(..., description="开关状态")
+    time: str = Field(..., description="执行时间，格式 HH:mm")
+    project_id: Optional[int] = Field(None, description="目标项目ID")
+    count: int = Field(5, description="生成数量")
+    task_type: str = Field("article_gen", description="任务类型标识")
 
 
-class JobConfigRequest(BaseModel):
-    """批量任务配置请求"""
-    article_gen: Optional[JobConfig] = None
-    index_check: Optional[JobConfig] = None
-    article_publish: Optional[JobConfig] = None
+# ==================== 服务单例管理 ====================
 
-
-# 全局服务实例
 _scheduler_service = None
 
 
 def get_scheduler():
-    """获取定时任务服务单例并初始化数据库工厂"""
+    """获取并确保调度引擎已打火启动"""
     global _scheduler_service
     if _scheduler_service is None:
         _scheduler_service = get_scheduler_service()
-        # 设置数据库工厂，确保异步任务能正常开启DB Session
-        _scheduler_service.set_db_factory(lambda: get_db().__next__())
+        # 设置数据库工厂，供后台任务开启 Session
+        _scheduler_service.set_db_factory(lambda: next(get_db()))
+
+    # 🌟 关键：确保每次调用 API 时引擎都是 Start 状态
+    _scheduler_service.start()
     return _scheduler_service
 
 
-# ==================== 定时任务配置存储 ====================
-# 内存存储配置（正式环境建议后续迁移至数据库）
-_job_configs: Dict[str, JobConfig] = {
-    "article_gen": JobConfig(
-        enabled=False,
-        schedule_type="daily",
-        time="09:00",
-        count=5
-    ),
-    "index_check": JobConfig(
-        enabled=True,
-        schedule_type="daily",
-        time="02:00",
-        platforms=["doubao", "qianwen", "deepseek"],
-        concurrency=3
-    ),
-    "article_publish": JobConfig(
-        enabled=False,
-        schedule_type="daily",
-        time="10:00",
-        platforms=["zhihu", "baijiahao"],
-        count=3
-    ),
-}
-
-
-# ==================== 辅助函数：同步配置到调度器 ====================
-
-def sync_job_with_scheduler(job_type: str, config: JobConfig):
-    """根据配置更新或移除 APScheduler 中的任务"""
-    scheduler = get_scheduler()
-    job_id = f"scheduled_{job_type}"
-
-    # 如果禁用，则移除任务
-    if not config.enabled:
-        try:
-            if scheduler.scheduler.get_job(job_id):
-                scheduler.scheduler.remove_job(job_id)
-                logger.info(f"已移除定时任务: {job_id}")
-        except Exception as e:
-            logger.error(f"移除任务失败: {e}")
-        return
-
-    # 如果启用，则添加或更新任务
-    try:
-        hour, minute = config.time.split(":")
-
-        # 这里以 article_gen 为例，对接你刚在 service 里写的真逻辑
-        if job_type == "article_gen":
-            # 注意：实际场景中这里需要具体的 project_id 和 company_name
-            # 演示环境下我们假设有默认逻辑或从配置读取
-            scheduler.add_custom_geo_job(
-                keyword_id=config.project_id or 0,
-                company_name="AutoSystem",
-                cron_time=config.time
-            )
-        elif job_type == "index_check":
-            # 保持原有的每日检测逻辑更新
-            from apscheduler.triggers.cron import CronTrigger
-            scheduler.scheduler.add_job(
-                scheduler.daily_index_check,
-                CronTrigger(hour=int(hour), minute=int(minute)),
-                id=job_id,
-                replace_existing=True
-            )
-        logger.info(f"已同步调度配置: {job_type} -> {config.time}")
-    except Exception as e:
-        logger.error(f"同步任务到调度器失败: {e}")
-
-
-# ==================== 定时任务API (满足前端展示需求) ====================
+# ==================== 接口实现 ====================
 
 @router.get("/jobs", response_model=List[JobInfo])
-async def get_scheduled_jobs():
-    """获取当前所有活跃的定时任务列表"""
-    scheduler = get_scheduler()
-    return scheduler.get_scheduled_jobs()
-
-
-@router.get("/config", response_model=Dict[str, JobConfig])
-async def get_job_configs():
-    """获取所有任务的参数配置"""
-    return _job_configs
-
-
-@router.post("/config", response_model=ApiResponse)
-async def update_job_configs(data: JobConfigRequest):
-    """更新全量任务配置，并实时同步到调度引擎"""
-    global _job_configs
+async def get_all_jobs():
+    """
+    获取任务列表
+    用于验证‘定时时间’是否成功进入调度引擎排班
+    """
+    service = get_scheduler()
     try:
-        for job_type in ["article_gen", "index_check", "article_publish"]:
-            config = getattr(data, job_type)
-            if config:
-                _job_configs[job_type] = config
-                sync_job_with_scheduler(job_type, config)
-
-        return ApiResponse(success=True, message="任务配置已更新并同步")
+        jobs = service.get_scheduled_jobs()
+        return jobs
     except Exception as e:
-        logger.error(f"更新配置失败: {e}")
-        return ApiResponse(success=False, message=f"更新失败: {str(e)}")
+        logger.error(f"查询任务排期失败: {e}")
+        raise HTTPException(status_code=500, detail="调度引擎数据读取异常")
 
 
-@router.post("/config/{job_type}", response_model=ApiResponse)
-async def update_single_job_config(job_type: str, config: JobConfig):
-    """更新单个特定任务（如仅修改生成时间）"""
-    global _job_configs
-    if job_type not in _job_configs:
-        return ApiResponse(success=False, message=f"未知任务类型: {job_type}")
+@router.post("/config/article_gen", response_model=ApiResponse)
+async def save_article_gen_config(payload: TaskConfigPayload):
+    """
+    保存配置：对应前端卡片的‘开关’和‘保存’动作。
+    """
+    service = get_scheduler()
 
     try:
-        _job_configs[job_type] = config
-        sync_job_with_scheduler(job_type, config)
-        return ApiResponse(success=True, message=f"{job_type} 配置已实时同步")
+        # 封装参数
+        params = {
+            "project_id": payload.project_id,
+            "count": payload.count
+        }
+
+        # 同步更新 APScheduler 中的定时计划
+        service.update_schedule(
+            task_type=payload.task_type,
+            time_str=payload.time,
+            params=params,
+            enabled=payload.enabled
+        )
+
+        msg = f"配置成功！任务已{'挂载排期' if payload.enabled else '从引擎卸载'}"
+        return ApiResponse(
+            success=True,
+            message=msg,
+            data={"target_time": payload.time}
+        )
     except Exception as e:
-        return ApiResponse(success=False, message=str(e))
-
-
-# ==================== 触发器API (手动触发逻辑) ====================
-
-@router.post("/trigger-check", response_model=ApiResponse)
-async def trigger_index_check(background_tasks: BackgroundTasks):
-    """手动立即执行：收录检测"""
-    scheduler = get_scheduler()
-    background_tasks.add_task(scheduler.trigger_check_now)
-    return ApiResponse(success=True, message="收录检测任务已在后台启动")
+        logger.error(f"保存任务配置失败: {e}")
+        return ApiResponse(success=False, message=f"配置保存异常: {str(e)}")
 
 
 @router.post("/trigger-article-gen", response_model=ApiResponse)
-async def trigger_article_gen(
+async def trigger_article_gen_manually(
         project_id: int = Body(..., embed=True),
-        company_name: str = Body("默认公司", embed=True),
-        background_tasks: BackgroundTasks = None
+        count: int = Body(5, embed=True),
+        task_type: str = Body("article_gen", embed=True)
 ):
     """
-    手动立即执行：文章生成任务
-    满足前辈要求的 API 接口设计：输入(project_id) -> 输出(ApiResponse)
+    立即运行一次：点击后后台批量执行，并返回执行日志响应。
     """
-    scheduler = get_scheduler()
-    # 调用 scheduler_service 中的真实异步生成逻辑
-    background_tasks.add_task(
-        scheduler.execute_geo_generation_workflow,
-        project_id,
-        company_name,
-        "zhihu"
+    service = get_scheduler()
+
+    # 构造即时运行参数
+    params = {"project_id": project_id, "count": count}
+
+    # 获取实时执行日志
+    logs = await service.run_task_immediately(task_type, params)
+
+    return ApiResponse(
+        success=True,
+        message="立即执行指令已完成",
+        data={"logs": logs},  # 将重要的日志响应返回给前端展示
+        timestamp=datetime.now().isoformat()
     )
-    return ApiResponse(success=True, message=f"已为项目 {project_id} 启动文章生成流程")
 
-
-@router.post("/trigger-alert", response_model=ApiResponse)
-async def trigger_alert_check(background_tasks: BackgroundTasks):
-    """手动立即执行：预警检查"""
-    scheduler = get_scheduler()
-    background_tasks.add_task(scheduler.trigger_alert_now)
-    return ApiResponse(success=True, message="预警检查任务已触发")
-
-
-# ==================== 服务控制API ====================
 
 @router.get("/status")
 async def get_scheduler_status():
-    """获取调度服务运行状态，供前端看板显示"""
-    scheduler = get_scheduler()
+    """获取引擎整体运行状态"""
+    service = get_scheduler()
     return {
-        "running": scheduler.scheduler.running if scheduler else False,
-        "job_count": len(scheduler.get_scheduled_jobs()) if scheduler else 0,
-        "current_time": datetime.now().isoformat(),
-        "configs": _job_configs
+        "engine_running": service.scheduler.running,
+        "timezone": str(service.scheduler.timezone),
+        "job_count": len(service.scheduler.get_jobs()),
+        "server_time": datetime.now().isoformat()
     }
-
-
-@router.post("/start", response_model=ApiResponse)
-async def start_scheduler():
-    """手动启动调度服务"""
-    scheduler = get_scheduler()
-    if scheduler.scheduler.running:
-        return ApiResponse(success=True, message="定时任务服务已在运行")
-    scheduler.start()
-    return ApiResponse(success=True, message="服务启动成功")
-
-
-@router.post("/stop", response_model=ApiResponse)
-async def stop_scheduler():
-    """手动停止调度服务"""
-    scheduler = get_scheduler()
-    scheduler.stop()
-    return ApiResponse(success=True, message="服务已安全停止")
