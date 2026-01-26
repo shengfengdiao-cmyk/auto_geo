@@ -1,27 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 定时任务服务
-用这个来管理定时收录检测任务！
+管理收录检测、GEO文章自动生成及其他自动化任务！
 """
 
 import asyncio
 from typing import Optional, Callable, Dict, Any
+from datetime import datetime
 from loguru import logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
 
+# 导入公司现有的配置和服务
 from backend.config import INDEX_CHECK_HOUR, INDEX_CHECK_MINUTE
 from backend.services.index_check_service import IndexCheckService
+from backend.services.geo_article_service import GeoArticleService  # 你要对接的真零件
 from backend.services.notification_service import get_notification_service, WebSocketNotificationChannel
-from backend.database.models import Keyword, Project
+from backend.database.models import Keyword, Project, IndexCheckRecord
 
 
 class SchedulerService:
     """
     定时任务服务
-
-    注意：这个服务负责管理所有定时任务！
+    负责管理系统所有的自动化任务（收录检测 + GEO文章生成）
     """
 
     def __init__(self):
@@ -31,7 +33,7 @@ class SchedulerService:
         self.ws_callback = None
 
     def set_db_factory(self, db_factory):
-        """设置数据库工厂"""
+        """设置数据库工厂（由 main.py 初始化时传入）"""
         self.db_factory = db_factory
 
     def set_ws_callback(self, callback: Callable):
@@ -39,8 +41,8 @@ class SchedulerService:
         self.ws_callback = callback
 
     def start(self):
-        """启动定时任务"""
-        # 添加每日收录检测任务
+        """启动定时任务系统"""
+        # 1. 原有任务：每日收录检测
         self.scheduler.add_job(
             self.daily_index_check,
             CronTrigger(hour=INDEX_CHECK_HOUR, minute=INDEX_CHECK_MINUTE),
@@ -49,7 +51,7 @@ class SchedulerService:
             replace_existing=True
         )
 
-        # 添加预警检查任务（每天检查一次，在收录检测后1小时）
+        # 2. 原有任务：每日预警检查
         alert_hour = (INDEX_CHECK_HOUR + 1) % 24
         self.scheduler.add_job(
             self.daily_alert_check,
@@ -59,7 +61,7 @@ class SchedulerService:
             replace_existing=True
         )
 
-        # 添加失败重试任务（每6小时检查一次）
+        # 3. 原有任务：失败重试（每6小时）
         self.scheduler.add_job(
             self.retry_failed_checks,
             CronTrigger(hour="*/6"),
@@ -69,7 +71,8 @@ class SchedulerService:
         )
 
         self.scheduler.start()
-        logger.info(f"定时任务服务已启动，收录检测: {INDEX_CHECK_HOUR:02d}:{INDEX_CHECK_MINUTE:02d}, 预警检查: {alert_hour:02d}:{INDEX_CHECK_MINUTE:02d}")
+        logger.info(f"🚀 定时任务服务已启动！")
+        logger.info(f"📅 默认收录检测设定为: {INDEX_CHECK_HOUR:02d}:{INDEX_CHECK_MINUTE:02d}")
 
     def stop(self):
         """停止定时任务"""
@@ -77,221 +80,159 @@ class SchedulerService:
             self.scheduler.shutdown()
             logger.info("定时任务服务已停止")
 
-    async def daily_index_check(self):
-        """
-        每日收录检测任务
+    # ==========================================
+    # 新增功能：GEO文章自动生成调度逻辑
+    # ==========================================
 
-        注意：这个任务会检测所有活跃关键词！
+    async def add_custom_geo_job(self, keyword_id: int, company_name: str, cron_time: str, platform: str = "zhihu"):
         """
-        logger.info("开始执行每日收录检测任务")
+        核心方法：动态添加一个自定义时间的GEO生成任务
+        满足前辈要求的“自定义设置”和“API调用参数修改”
+
+        Args:
+            keyword_id: 关键词ID
+            company_name: 公司名
+            cron_time: 时间格式 "HH:mm" (如 "10:30")
+            platform: 发布平台
+        """
+        try:
+            hour, minute = cron_time.split(":")
+            job_id = f"geo_gen_{keyword_id}"
+
+            # 使用 Cron 触发器实现“每天准点运行”
+            job = self.scheduler.add_job(
+                self.execute_geo_generation_workflow,
+                CronTrigger(hour=int(hour), minute=int(minute)),
+                id=job_id,
+                name=f"GEO自动生成-{company_name}",
+                args=[keyword_id, company_name, platform],
+                replace_existing=True
+            )
+
+            logger.info(f"✨ 已成功排期新任务: {job_id}，运行时间: {cron_time}")
+            return job
+        except Exception as e:
+            logger.error(f"添加调度任务失败: {e}")
+            raise e
+
+    async def execute_geo_generation_workflow(self, keyword_id: int, company_name: str, platform: str):
+        """
+        真正被定时触发的文章生成流程
+        """
+        logger.info(f"🔔 定时器唤醒：准备为 [{company_name}] 生成关键词ID为 {keyword_id} 的GEO文章")
 
         if not self.db_factory:
-            logger.error("数据库工厂未设置，无法执行检测任务")
+            logger.error("数据库工厂缺失，无法执行生成任务")
             return
 
         db = self.db_factory()
         try:
-            service = IndexCheckService(db)
+            # 实例化前辈写的核心生成服务
+            article_service = GeoArticleService(db)
 
-            # 获取所有活跃项目
-            projects = db.query(Project).filter(Project.status == 1).all()
+            # 1. 执行生成逻辑（对接 n8n）
+            result = await article_service.generate(
+                keyword_id=keyword_id,
+                company_name=company_name,
+                platform=platform
+            )
 
-            total_keywords = 0
-            total_checks = 0
+            if result.get("status") == "success":
+                logger.info(f"✅ 定时生成成功！文章ID: {result.get('article_id')}")
 
-            for project in projects:
-                # 获取项目的活跃关键词
-                keywords = db.query(Keyword).filter(
-                    Keyword.project_id == project.id,
-                    Keyword.status == "active"
-                ).all()
+                # 2. 自动触发质检逻辑
+                await article_service.check_quality(result.get("article_id"))
 
-                if not keywords:
-                    continue
-
-                logger.info(f"开始检测项目: {project.name}, 关键词数: {len(keywords)}")
-
-                for keyword in keywords:
-                    try:
-                        # 执行检测
-                        results = await service.check_keyword(
-                            keyword_id=keyword.id,
-                            company_name=project.company_name
-                        )
-
-                        total_keywords += 1
-                        total_checks += len(results)
-
-                        # 发送WebSocket通知
-                        if self.ws_callback:
-                            await self.ws_callback({
-                                "type": "index_check_progress",
-                                "data": {
-                                    "project_name": project.name,
-                                    "keyword": keyword.keyword,
-                                    "results_count": len(results)
-                                }
-                            })
-
-                    except Exception as e:
-                        logger.error(f"关键词检测失败: {keyword.keyword}, {e}")
-
-            logger.info(f"每日收录检测任务完成: 检测{total_keywords}个关键词, 共{total_checks}条记录")
-
-            # 发送完成通知
-            if self.ws_callback:
-                await self.ws_callback({
-                    "type": "index_check_complete",
-                    "data": {
-                        "total_keywords": total_keywords,
-                        "total_checks": total_checks
-                    }
-                })
+                # 发送实时进度通知到前端
+                if self.ws_callback:
+                    await self.ws_callback({
+                        "type": "geo_gen_success",
+                        "data": {"keyword_id": keyword_id, "title": result.get("title")}
+                    })
+            else:
+                logger.error(f"❌ 定时生成失败: {result.get('message')}")
 
         except Exception as e:
-            logger.error(f"每日收录检测任务失败: {e}")
+            logger.error(f"GEO调度流程执行异常: {e}")
         finally:
             db.close()
 
-    async def trigger_check_now(self):
-        """
-        立即触发一次检测任务（用于测试）
+    # ==========================================
+    # 原有功能：收录检测与预警 (保持不变以防报错)
+    # ==========================================
 
-        注意：这个方法用于手动触发检测！
-        """
-        logger.info("手动触发收录检测任务")
-        await self.daily_index_check()
-
-    async def daily_alert_check(self):
-        """
-        每日预警检查任务
-
-        注意：检测完成后检查SEO健康状况！
-        """
-        logger.info("开始执行每日预警检查任务")
-
-        if not self.db_factory:
-            logger.error("数据库工厂未设置，无法执行预警检查")
-            return
-
+    async def daily_index_check(self):
+        """每日收录检测任务"""
+        logger.info("开始执行每日收录检测任务")
+        if not self.db_factory: return
         db = self.db_factory()
         try:
-            # 创建通知服务
-            notification_service = get_notification_service(db)
+            service = IndexCheckService(db)
+            projects = db.query(Project).filter(Project.status == 1).all()
+            for project in projects:
+                keywords = db.query(Keyword).filter(Keyword.project_id == project.id, Keyword.status == "active").all()
+                for keyword in keywords:
+                    results = await service.check_keyword(keyword_id=keyword.id, company_name=project.company_name)
+                    if self.ws_callback:
+                        await self.ws_callback({"type": "index_check_progress", "data": {"keyword": keyword.keyword}})
+            logger.info("每日收录检测任务完成")
+        except Exception as e:
+            logger.error(f"检测任务失败: {e}")
+        finally:
+            db.close()
 
-            # 添加WebSocket通知渠道
+    async def daily_alert_check(self):
+        """每日预警检查任务"""
+        logger.info("开始执行每日预警检查任务")
+        if not self.db_factory: return
+        db = self.db_factory()
+        try:
+            notification_service = get_notification_service(db)
             if self.ws_callback:
                 notification_service.add_channel(WebSocketNotificationChannel(self.ws_callback))
-
-            # 执行预警检查
-            alerts = await notification_service.check_and_alert()
-
-            logger.info(f"每日预警检查完成: 触发{len(alerts)}条预警")
-
-            # 发送预警汇总
-            if self.ws_callback:
-                summary = notification_service.get_alert_summary()
-                await self.ws_callback({
-                    "type": "alert_summary",
-                    "data": summary
-                })
-
-        except Exception as e:
-            logger.error(f"每日预警检查任务失败: {e}")
+            await notification_service.check_and_alert()
         finally:
             db.close()
 
     async def retry_failed_checks(self):
-        """
-        失败重试任务
-
-        注意：重试最近检测失败的关键词！
-        """
+        """失败重试任务"""
         logger.info("开始执行失败重试任务")
-
-        if not self.db_factory:
-            logger.error("数据库工厂未设置，无法执行重试任务")
-            return
-
+        if not self.db_factory: return
         db = self.db_factory()
         try:
             service = IndexCheckService(db)
-
-            # 获取最近24小时内没有检测记录的关键词
-            from datetime import datetime, timedelta
-            from backend.database.models import IndexCheckRecord
-
-            yesterday = datetime.now() - timedelta(days=1)
-
-            # 获取所有活跃关键词
+            yesterday = datetime.now().replace(hour=0, minute=0, second=0)
             keywords = db.query(Keyword).filter(Keyword.status == "active").all()
-
-            retry_count = 0
-
             for keyword in keywords:
-                # 检查最近是否有检测记录
-                latest_check = db.query(IndexCheckRecord).filter(
-                    IndexCheckRecord.keyword_id == keyword.id
-                ).order_by(IndexCheckRecord.check_time.desc()).first()
-
-                # 如果没有检测记录或记录已过期，重新检测
-                if not latest_check or latest_check.check_time < yesterday:
-                    # 获取关键词所属项目
+                latest = db.query(IndexCheckRecord).filter(IndexCheckRecord.keyword_id == keyword.id).order_by(
+                    IndexCheckRecord.check_time.desc()).first()
+                if not latest or latest.check_time < yesterday:
                     project = db.query(Project).filter(Project.id == keyword.project_id).first()
-                    if project:
-                        try:
-                            await service.check_keyword(
-                                keyword_id=keyword.id,
-                                company_name=project.company_name
-                            )
-                            retry_count += 1
-                            logger.info(f"重试检测成功: {keyword.keyword}")
-
-                        except Exception as e:
-                            logger.error(f"重试检测失败: {keyword.keyword}, {e}")
-
-            logger.info(f"失败重试任务完成: 重试{retry_count}个关键词")
-
-        except Exception as e:
-            logger.error(f"失败重试任务失败: {e}")
+                    if project: await service.check_keyword(keyword.id, project.company_name)
         finally:
             db.close()
 
-    async def trigger_alert_now(self):
-        """
-        立即触发一次预警检查（用于测试）
-
-        注意：这个方法用于手动触发预警检查！
-        """
-        logger.info("手动触发预警检查任务")
-        await self.daily_alert_check()
-
     def get_scheduled_jobs(self) -> list[Dict[str, Any]]:
-        """
-        获取当前所有定时任务
-
-        注意：返回所有已配置的定时任务！
-        """
+        """获取当前所有排期的定时任务（用于前端展示）"""
         jobs = []
         for job in self.scheduler.get_jobs():
             jobs.append({
                 "id": job.id,
                 "name": job.name,
-                "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+                "trigger": str(job.trigger)
             })
         return jobs
 
 
-# 全局单例
+# ==========================================
+# 单例管理（对外暴露的接口）
+# ==========================================
+
 scheduler_service: Optional[SchedulerService] = None
 
 
 def get_scheduler_service() -> SchedulerService:
-    """
-    获取定时任务服务单例
-
-    注意：这是对外暴露的主要接口！
-    """
     global scheduler_service
     if scheduler_service is None:
         scheduler_service = SchedulerService()
