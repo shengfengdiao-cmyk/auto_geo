@@ -1,577 +1,250 @@
 # -*- coding: utf-8 -*-
 """
-知乎发布适配器 - 完整版
-老王根据研究结果更新！支持：封面、AI声明、话题、富文本
+知乎发布适配器 - v4.2 合并版
+合并策略：
+1. 核心保留 v4.1 (多图流、剪贴板注入、强制配图)，确保图片上传成功率
+2. 融合 upstream (同事) 的 AI 声明功能
 """
 
 import asyncio
 import re
 import os
-import tempfile
-from typing import Dict, Any, List, Optional, Tuple
-from pathlib import Path
-from playwright.async_api import Page, FileChooser
-from loguru import logger
 import httpx
+import tempfile
+import base64
+import random
+import urllib.parse
+from typing import Dict, Any, List, Optional
+from playwright.async_api import Page
+from loguru import logger
 
-from .base import BasePublisher
+from .base import BasePublisher, registry
 
 
 class ZhihuPublisher(BasePublisher):
-    """
-    知乎发布适配器 - 完整版
-
-    支持功能：
-    - 标题输入
-    - 正文输入（富文本 + 图片上传）
-    - 封面图片上传
-    - AI创作声明
-    - 话题添加
-    - 发布
-    """
-
     async def publish(self, page: Page, article: Any, account: Any) -> Dict[str, Any]:
-        """发布文章到知乎"""
+        temp_files = []
         try:
-            # 1. 导航到发布页面
-            if not await self.navigate_to_publish_page(page):
-                return {"success": False, "platform_url": None, "error_msg": "导航失败"}
+            logger.info("🚀 开始知乎发布 (v4.2 合并加强版)...")
 
-            # 2. 等待页面加载，检查登录状态
-            await asyncio.sleep(3)
-            if "signin" in page.url or "login" in page.url:
-                return {"success": False, "platform_url": None, "error_msg": "登录已过期，请重新授权"}
-
-            # 3. 等待编辑器就绪
-            await self._wait_for_editor_ready(page)
-
-            # 4. 填充标题
-            if not await self._fill_title(page, article.title):
-                return {"success": False, "platform_url": None, "error_msg": "标题填充失败"}
-
-            # 5. 填充正文（支持图片上传）
-            if not await self._fill_content_with_images(page, article.content):
-                return {"success": False, "platform_url": None, "error_msg": "正文填充失败"}
-
-            # 6. 添加封面图片（如果有）
-            if hasattr(article, 'cover_image') and article.cover_image:
-                await self._upload_cover_image(page, article.cover_image)
-
-            # 7. 设置AI创作声明
-            if hasattr(article, 'use_ai_declaration') and article.use_ai_declaration:
-                await self._set_ai_declaration(page)
-
-            # 8. 添加话题（如果有）
-            if hasattr(article, 'topics') and article.topics:
-                await self._add_topics(page, article.topics)
-
-            # 9. 点击发布
-            if not await self._click_publish(page):
-                return {"success": False, "platform_url": None, "error_msg": "发布失败"}
-
-            # 10. 等待发布结果
-            result = await self._wait_for_publish_result(page)
-
-            return result
-
-        except Exception as e:
-            logger.error(f"知乎发布失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "platform_url": None, "error_msg": str(e)}
-
-    async def _wait_for_editor_ready(self, page: Page) -> bool:
-        """等待知乎编辑器准备就绪"""
-        try:
-            if await self.wait_for_selector(page, "textarea[placeholder*='标题']", 15000):
-                logger.info("✅ 编辑器已就绪")
-                await asyncio.sleep(1)
-                return True
-            return True
-        except Exception:
-            return True
-
-    async def _fill_title(self, page: Page, title: str) -> bool:
-        """填充标题"""
-        try:
-            selector = "textarea[placeholder*='请输入标题']"
-
-            if await self.wait_for_selector(page, selector, 5000):
-                # 使用JavaScript设置值
-                await page.evaluate("""
-                    (title) => {
-                        const textarea = document.querySelector("textarea[placeholder*='请输入标题']");
-                        if (textarea) {
-                            textarea.value = title;
-                            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                            textarea.dispatchEvent(new Event('change', { bubbles: true }));
-                            return true;
-                        }
-                        return false;
-                    }
-                """, title)
-                logger.info(f"✅ 标题已填充: {title[:30]}...")
-                await asyncio.sleep(0.5)
-                return True
-
-            return False
-        except Exception as e:
-            logger.error(f"标题填充失败: {e}")
-            return False
-
-    async def _fill_content_with_images(self, page: Page, content: str) -> bool:
-        """
-        填充正文（支持图片上传）
-
-        策略：
-        1. 解析Markdown，提取图片URL
-        2. 填充纯文本内容
-        3. 点击工具栏图片按钮上传每张图片
-        """
-        try:
-            editor_selector = ".public-DraftEditor-content"
-
-            if await self.wait_for_selector(page, editor_selector, 5000):
-                # 点击编辑器激活
-                await page.click(editor_selector)
-                await asyncio.sleep(0.5)
-
-                # 清空现有内容
-                await page.keyboard.press("Control+A")
-                await asyncio.sleep(0.2)
-                await page.keyboard.press("Delete")
-                await asyncio.sleep(0.3)
-
-                # 解析内容，提取图片URL
-                text_content, image_urls = self._parse_markdown_with_images(content)
-
-                logger.info(f"解析到 {len(image_urls)} 张图片")
-
-                # 先填充纯文本内容（移除图片标记）
-                await page.evaluate(f"navigator.clipboard.writeText({repr(text_content)})")
-                await asyncio.sleep(0.1)
-                await page.keyboard.press("Control+V")
-                await asyncio.sleep(1)
-
-                logger.info("✅ 正文文本已填充")
-
-                # 上传图片
-                if image_urls:
-                    await self._upload_images_to_editor(page, image_urls)
-
-                return True
-
-            return False
-        except Exception as e:
-            logger.error(f"正文填充失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-    def _parse_markdown_with_images(self, content: str) -> Tuple[List[str], List[str]]:
-        """
-        解析Markdown，分离文本和图片
-
-        Returns:
-            (文本列表, 图片URL列表)
-        """
-        # 匹配Markdown图片语法 ![alt](url)
-        img_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
-
-        # 提取所有图片
-        images = re.findall(img_pattern, content)
-
-        # 移除图片标记，得到纯文本
-        text = re.sub(img_pattern, '', content)
-
-        # 处理标题
-        text = re.sub(r'^###\s+(.+)$', r'\n\1\n', text, flags=re.MULTILINE)
-        text = re.sub(r'^##\s+(.+)$', r'\n\n【\1】\n\n', text, flags=re.MULTILINE)
-        text = re.sub(r'^#\s+(.+)$', r'\n\n========== \1 ==========\n\n', text, flags=re.MULTILINE)
-
-        # 移除加粗标记
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-
-        # 移除链接标记
-        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1', text)
-
-        # 处理列表
-        text = re.sub(r'^-\s+(.+)$', r'• \1', text, flags=re.MULTILINE)
-        text = re.sub(r'^\d+\.\s+(.+)$', r'\1. ', text, flags=re.MULTILINE)
-
-        # 合并多余换行
-        text = re.sub(r'\n{4,}', '\n\n\n', text)
-
-        # 提取图片URL
-        image_urls = [url for alt, url in images]
-
-        return [text.strip()], image_urls
-
-    async def _upload_images_to_editor(self, page: Page, image_urls: List[str]) -> bool:
-        """
-        上传图片到编辑器
-
-        步骤：
-        1. 点击工具栏的图片按钮（文本是"图片"）
-        2. 监听文件选择器
-        3. 上传图片文件
-        """
-        try:
-            logger.info(f"开始上传 {len(image_urls)} 张图片")
-
-            # 工具栏图片按钮选择器
-            image_button_selectors = [
-                "button:has-text('图片')",
-                ".ToolbarButton:has-text('图片')",
-                "button .ZDI--Image24",  # SVG图标类名
-            ]
-
-            for i, img_url in enumerate(image_urls):
-                try:
-                    logger.info(f"上传第 {i+1}/{len(image_urls)} 张图片: {img_url}")
-
-                    # 1. 下载图片
-                    temp_file = await self._download_image(img_url)
-                    if not temp_file:
-                        logger.warning(f"图片下载失败: {img_url}")
-                        continue
-
-                    # 2. 点击工具栏图片按钮并监听文件选择
-                    async with page.expect_file_chooser() as fc_info:
-                        # 尝试多种选择器点击图片按钮
-                        clicked = False
-                        for selector in image_button_selectors:
-                            try:
-                                btn = await page.query_selector(selector)
-                                if btn:
-                                    await btn.click()
-                                    clicked = True
-                                    logger.debug(f"已点击图片按钮: {selector}")
-                                    break
-                            except Exception:
-                                continue
-
-                        if not clicked:
-                            # 尝试通过SVG图标查找
-                            await page.evaluate("""
-                                () => {
-                                    const svg = document.querySelector('.ZDI--Image24');
-                                    if (svg) {
-                                        const btn = svg.closest('button');
-                                        if (btn) btn.click();
-                                    }
-                                }
-                            """)
-
-                    # 3. 选择文件上传
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(temp_file)
-                    logger.info(f"✅ 第 {i+1} 张图片已上传")
-
-                    # 4. 等待上传完成
-                    await asyncio.sleep(2)
-
-                    # 清理临时文件
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-
-                except Exception as e:
-                    logger.error(f"上传第 {i+1} 张图片失败: {e}")
-                    continue
-
-            logger.info("✅ 图片上传完成")
-            return True
-
-        except Exception as e:
-            logger.error(f"图片上传失败: {e}")
-            return False
-
-    async def _convert_markdown_to_rich_text(self, page: Page, markdown: str) -> str:
-        """
-        将Markdown转换为知乎编辑器可识别的格式
-
-        策略：
-        1. 提取图片URL，后面单独上传
-        2. 将Markdown格式转换为纯文本
-        3. 使用知乎编辑器自身的格式化功能
-        """
-        # 移除图片标记（图片单独处理）
-        text = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', '', markdown)
-
-        # 处理标题 - 转换为带换行的文本
-        text = re.sub(r'^###\s+(.+)$', r'\n\1\n', text, flags=re.MULTILINE)
-        text = re.sub(r'^##\s+(.+)$', r'\n\n【\1】\n\n', text, flags=re.MULTILINE)
-        text = re.sub(r'^#\s+(.+)$', r'\n\n========== \1 ==========\n\n', text, flags=re.MULTILINE)
-
-        # 移除加粗标记（保留文本）
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-
-        # 移除链接标记
-        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1', text)
-
-        # 处理列表
-        text = re.sub(r'^-\s+(.+)$', r'• \1', text, flags=re.MULTILINE)
-        text = re.sub(r'^\d+\.\s+(.+)$', r'\1. ', text, flags=re.MULTILINE)
-
-        # 合并多余换行
-        text = re.sub(r'\n{4,}', '\n\n\n', text)
-
-        return text.strip()
-
-    async def _upload_cover_image(self, page: Page, image_url: str) -> bool:
-        """
-        上传封面图片
-
-        元素：label.UploadPicture-wrapper > input.UploadPicture-input[type="file"]
-        """
-        try:
-            logger.info(f"开始上传封面图片: {image_url}")
-
-            # 1. 下载图片
-            temp_file = await self._download_image(image_url)
-            if not temp_file:
-                logger.warning("封面图片下载失败")
-                return False
-
-            # 2. 设置文件选择监听
-            async with page.expect_file_chooser() as fc_info:
-                # 3. 点击封面上传按钮
-                await page.click("label.UploadPicture-wrapper")
-
-            # 4. 选择文件
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(temp_file)
-            logger.info("✅ 封面图片已上传")
-
-            # 5. 等待上传完成
-            await asyncio.sleep(2)
-
-            # 清理临时文件
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-
-            return True
-
-        except Exception as e:
-            logger.error(f"封面上传失败: {e}")
-            return False
-
-    async def _set_ai_declaration(self, page: Page) -> bool:
-        """
-        设置AI创作声明
-
-        元素：button[title*="AI"] 或包含"AI助手"文本的按钮
-        """
-        try:
-            logger.info("设置AI创作声明")
-
-            # AI助手按钮选择器
-            selectors = [
-                "button:has-text('AI助手')",
-                ".ToolbarButton:has-text('AI')",
-                "[class*='AiAssistant']",
-            ]
-
-            clicked = False
-            for selector in selectors:
-                try:
-                    if await self.wait_for_selector(page, selector, 5000):
-                        await page.click(selector)
-                        clicked = True
-                        logger.info("✅ 已点击AI助手按钮")
-                        await asyncio.sleep(1)
-                        break
-                except Exception:
-                    continue
-
-            if not clicked:
-                logger.warning("未找到AI助手按钮")
-                return False
-
-            # 查找并点击"AI辅助创作"选项
-            # 等待弹出菜单
-            await asyncio.sleep(1)
-
-            ai_option_selectors = [
-                "text=AI辅助创作",
-                "[role='menuitem']:has-text('AI')",
-                ".css-jjc8wi",  # 从研究中获取的类名
-            ]
-
-            for selector in ai_option_selectors:
-                try:
-                    element = await page.query_selector(selector)
-                    if element:
-                        await element.click()
-                        logger.info("✅ 已选择AI辅助创作")
-                        await asyncio.sleep(0.5)
-                        return True
-                except Exception:
-                    continue
-
-            logger.warning("未找到AI辅助创作选项，可能已默认选择")
-            return True
-
-        except Exception as e:
-            logger.error(f"设置AI声明失败: {e}")
-            return False
-
-    async def _add_topics(self, page: Page, topics: List[str]) -> bool:
-        """
-        添加话题
-
-        从研究中发现话题输入框可能需要滚动或点击才能显示
-        """
-        try:
-            logger.info(f"添加话题: {topics}")
-
-            # 话题输入框可能在页面下方，需要先滚动
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(1)
-
-            # 尝试多种方式找到话题输入框
-            topic_selectors = [
-                "input[placeholder*='话题']",
-                "input[placeholder*='添加话题']",
-                "[class*='TopicInput']",
-                "[class*='TagInput']",
-            ]
-
-            topic_input = None
-            for selector in topic_selectors:
-                try:
-                    topic_input = await page.query_selector(selector)
-                    if topic_input:
-                        break
-                except Exception:
-                    continue
-
-            if not topic_input:
-                logger.warning("未找到话题输入框，尝试其他方式")
-
-                # 可能需要点击"添加话题"按钮
-                add_topic_buttons = [
-                    "button:has-text('添加话题')",
-                    "text=添加话题",
-                ]
-
-                for btn_selector in add_topic_buttons:
-                    try:
-                        btn = await page.query_selector(btn_selector)
-                        if btn:
-                            await btn.click()
-                            await asyncio.sleep(1)
-                            break
-                    except Exception:
-                        continue
-
-            # 输入话题
-            for topic in topics[:3]:  # 最多3个话题
-                try:
-                    # 点击话题输入框
-                    await page.click("input[placeholder*='话题'], input[placeholder*='添加'], [class*='TopicInput'], [class*='TagInput']")
-                    await asyncio.sleep(0.3)
-
-                    # 输入话题名称
-                    await page.fill("input[placeholder*='话题'], input[placeholder*='添加'], [class*='TopicInput'], [class*='TagInput']", topic)
-                    await asyncio.sleep(0.5)
-
-                    # 按回车确认
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(0.5)
-
-                    logger.info(f"✅ 已添加话题: {topic}")
-                except Exception as e:
-                    logger.debug(f"添加话题 {topic} 失败: {e}")
-
-            return True
-
-        except Exception as e:
-            logger.error(f"添加话题失败: {e}")
-            return False
-
-    async def _download_image(self, url: str) -> Optional[str]:
-        """下载图片到临时文件"""
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    content_type = resp.headers.get('Content-Type', 'image/jpeg')
-                    ext = '.jpg'
-                    if 'png' in content_type:
-                        ext = '.png'
-                    elif 'gif' in content_type:
-                        ext = '.gif'
-                    elif 'webp' in content_type:
-                        ext = '.webp'
-
-                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-                        f.write(resp.content)
-                        return f.name
-                return None
-        except Exception as e:
-            logger.error(f"图片下载失败: {e}")
-            return None
-
-    async def _click_publish(self, page: Page) -> bool:
-        """点击发布按钮"""
-        try:
-            # 等待发布按钮可点击（按钮在填入内容后才会启用）
-            await asyncio.sleep(2)
-
-            selectors = [
-                "button.PublishButton",
-                "button[class*='PublishButton']:not([disabled])",
-                "button:has-text('发布'):not([disabled])",
-                ".css-d0uhtl:not([disabled])",  # 从研究获取的类名
-            ]
-
-            for selector in selectors:
-                try:
-                    # 检查按钮是否存在且可点击
-                    if await self.wait_for_selector(selector, 5000):
-                        # 再次检查是否禁用
-                        is_disabled = await page.is_disabled(selector)
-                        if not is_disabled:
-                            await page.click(selector)
-                            logger.info("✅ 发布按钮已点击")
-                            await asyncio.sleep(1)
-                            return True
-                        else:
-                            logger.debug(f"按钮 {selector} 仍处于disabled状态")
-                except Exception as e:
-                    logger.debug(f"选择器 {selector} 失败: {e}")
-                    continue
-
-            logger.error("发布按钮不可点击或未找到")
-            return False
-
-        except Exception as e:
-            logger.error(f"点击发布失败: {e}")
-            return False
-
-    async def _wait_for_publish_result(self, page: Page) -> Dict[str, Any]:
-        """等待发布结果"""
-        try:
+            # 1. 导航
+            await page.goto(self.config["publish_url"], wait_until="networkidle", timeout=60000)
             await asyncio.sleep(5)
 
-            current_url = page.url
-            if "/p/" in current_url:
-                return {
-                    "success": True,
-                    "platform_url": current_url,
-                    "error_msg": None
-                }
+            # 2. 图像准备
+            # A. 提取正文链接
+            image_urls = re.findall(r'!\[.*?\]\(((?:https?://)?\S+?)\)', article.content)
+            # B. 清洗正文
+            clean_content = re.sub(r'!\[.*?\]\(.*?\)', '', article.content)
 
-            return {
-                "success": True,
-                "platform_url": current_url,
-                "error_msg": None
-            }
+            # C. 强制补图策略
+            if not image_urls:
+                keyword = article.title[:10] if article.title else "technology"
+                # 生成3张不同的图
+                for i in range(3):
+                    seed = random.randint(1, 1000)
+                    encoded_kw = urllib.parse.quote(f"high quality realistic photo of {keyword} {seed}")
+                    url = f"https://image.pollinations.ai/prompt/{encoded_kw}?width=800&height=600&nologo=true"
+                    image_urls.append(url)
+                logger.info(f"🎨 已自动生成 {len(image_urls)} 张配图链接")
+
+            # D. 下载图片
+            downloaded_paths = await self._download_images(image_urls)
+            temp_files.extend(downloaded_paths)
+
+            if not downloaded_paths:
+                return {"success": False, "error_msg": "图片下载失败，无法满足强制配图需求"}
+
+            # 3. 填充标题
+            await self._fill_title(page, article.title)
+
+            # 4. 填充正文
+            await self._fill_content_and_clean_ui(page, clean_content)
+
+            # 5. [新增] 设置 AI 声明 (来自同事的功能)
+            await self._set_ai_declaration(page)
+
+            # 6. 执行多图排版上传 (你的核心功能)
+            await self._handle_multi_image_upload(page, downloaded_paths)
+
+            # 7. 发布流程
+            topic_word = getattr(article, 'keyword_text', article.title[:4])
+            if not await self._handle_publish_process(page, topic_word):
+                return {"success": False, "error_msg": "发布确认环节失败"}
+
+            return await self._wait_for_publish_result(page)
 
         except Exception as e:
-            return {
-                "success": False,
-                "platform_url": None,
-                "error_msg": f"等待结果失败: {str(e)}"
+            logger.exception(f"❌ 知乎脚本致命故障: {str(e)}")
+            return {"success": False, "error_msg": str(e)}
+        finally:
+            for f in temp_files:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
+
+    async def _download_images(self, urls: List[str]) -> List[str]:
+        paths = []
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(headers=headers, verify=False, follow_redirects=True) as client:
+            for i, url in enumerate(urls[:3]):
+                for attempt in range(2):
+                    try:
+                        resp = await client.get(url, timeout=20.0)
+                        if resp.status_code == 200:
+                            if len(resp.content) < 1000: continue
+                            tmp_path = os.path.join(tempfile.gettempdir(), f"zh_v42_{random.randint(1000, 9999)}.jpg")
+                            with open(tmp_path, "wb") as f:
+                                f.write(resp.content)
+                            paths.append(tmp_path)
+                            logger.info(f"✅ 图片 {i + 1} 下载成功")
+                            break
+                    except:
+                        pass
+        return paths
+
+    async def _handle_multi_image_upload(self, page: Page, paths: List[str]):
+        """多图排版逻辑"""
+        try:
+            # Step 1: 上传封面
+            logger.info("🖼️ 正在设置文章封面...")
+            cover_input = page.locator("input.UploadPicture-input").first
+            if await cover_input.count() > 0:
+                await cover_input.set_input_files(paths[0])
+                await asyncio.sleep(3)
+
+            # Step 2: 遍历插入正文
+            editor = page.locator(".public-DraftEditor-content").first
+            await editor.click()
+
+            for i, image_path in enumerate(paths):
+                logger.info(f"📝 正在插入第 {i + 1}/{len(paths)} 张图片...")
+
+                if i == 0:
+                    await page.keyboard.press("Control+Home")
+                    await page.keyboard.press("Enter")
+                    await page.keyboard.press("ArrowUp")
+                else:
+                    for _ in range(4):
+                        await page.keyboard.press("PageDown")
+                        await asyncio.sleep(0.2)
+                    await page.keyboard.press("Enter")
+
+                await self._paste_image_via_js(page, image_path)
+                await asyncio.sleep(5)
+
+        except Exception as e:
+            logger.error(f"多图上传流程部分失败: {e}")
+
+    async def _paste_image_via_js(self, page: Page, image_path: str):
+        """剪贴板注入技术"""
+        with open(image_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode('utf-8')
+
+        await page.evaluate('''(data) => {
+            const { b64 } = data;
+            const byteCharacters = atob(b64);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
             }
+            const byteArray = new Uint8Array(byteNumbers);
+            const blob = new Blob([byteArray], { type: 'image/jpeg' });
+            const file = new File([blob], "auto_inserted.jpg", { type: 'image/jpeg' });
+
+            const dt = new DataTransfer();
+            dt.items.add(file);
+
+            const editor = document.querySelector(".public-DraftEditor-content");
+            const event = new ClipboardEvent("paste", {
+                clipboardData: dt,
+                bubbles: true,
+                cancelable: true
+            });
+            editor.dispatchEvent(event);
+        }''', {"b64": b64_data})
+
+    async def _fill_title(self, page: Page, title: str):
+        sel = "input[placeholder*='标题'], .WriteIndex-titleInput textarea"
+        await page.wait_for_selector(sel)
+        await page.fill(sel, title)
+
+    async def _fill_content_and_clean_ui(self, page: Page, content: str):
+        editor = ".public-DraftEditor-content"
+        await page.wait_for_selector(editor)
+        await page.click(editor)
+
+        await page.evaluate('''(text) => {
+            const dt = new DataTransfer();
+            dt.setData("text/plain", text);
+            const ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true });
+            document.querySelector(".public-DraftEditor-content").dispatchEvent(ev);
+        }''', content)
+
+        await asyncio.sleep(2)
+        try:
+            confirm = page.locator("button:has-text('确认并解析')").first
+            if await confirm.is_visible(timeout=3000):
+                await confirm.click()
+        except:
+            pass
+
+    async def _set_ai_declaration(self, page: Page):
+        """设置 AI 创作声明 (移植自 Upstream)"""
+        try:
+            logger.info("正在设置 AI 声明...")
+            # 查找并点击 AI 助手按钮
+            ai_btn = page.locator("button:has-text('AI助手'), .ToolbarButton:has-text('AI')").first
+            if await ai_btn.is_visible(timeout=3000):
+                await ai_btn.click()
+                await asyncio.sleep(1)
+                # 选择 AI 辅助创作
+                option = page.locator("text=AI辅助创作, [role='menuitem']:has-text('AI')").first
+                if await option.is_visible(timeout=2000):
+                    await option.click()
+                    logger.info("✅ 已勾选 AI 辅助创作声明")
+        except:
+            logger.warning("未找到 AI 声明入口，跳过此步")
+
+    async def _handle_publish_process(self, page: Page, topic: str) -> bool:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        try:
+            add_topic = page.locator("button:has-text('添加话题')").first
+            if await add_topic.is_visible(timeout=2000):
+                await add_topic.click()
+
+            topic_input = page.locator("input[placeholder*='话题']").first
+            await topic_input.fill(topic)
+            await asyncio.sleep(2)
+            suggestion = page.locator(".Suggestion-item, .PublishPanel-suggestionItem").first
+            if await suggestion.is_visible(timeout=2000):
+                await suggestion.click()
+            else:
+                await page.keyboard.press("Enter")
+        except:
+            pass
+
+        final_btn = page.locator(
+            "button.PublishPanel-submitButton, .WriteIndex-publishButton, button:has-text('发布')").last
+        for _ in range(5):
+            if await final_btn.is_enabled():
+                await final_btn.click(force=True)
+                return True
+            await asyncio.sleep(2)
+        return False
+
+    async def _wait_for_publish_result(self, page: Page) -> Dict[str, Any]:
+        for i in range(25):
+            if "/p/" in page.url and "/edit" not in page.url:
+                return {"success": True, "platform_url": page.url}
+            await asyncio.sleep(1)
+        return {"success": False, "error_msg": "发布超时"}
+
+
+# 注册
+ZHIHU_CONFIG = {"name": "知乎", "publish_url": "https://zhuanlan.zhihu.com/write", "color": "#0084FF"}
+registry.register("zhihu", ZhihuPublisher("zhihu", ZHIHU_CONFIG))

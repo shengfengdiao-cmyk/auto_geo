@@ -16,7 +16,7 @@ const routes: RouteRecordRaw[] = [
         path: 'dashboard',
         name: 'Dashboard',
         component: () => import('@/views/dashboard/DashboardPage.vue'),
-        meta: { title: '概览', icon: 'House' },
+        meta: { title: '首页', icon: 'House' }, // 原来的概览改为首页，避免名字冲突
       },
       {
         path: 'accounts',
@@ -67,6 +67,13 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '设置', icon: 'Setting' },
       },
       // ==================== GEO系统路由 ====================
+      // 🌟 新增：数据概览（仪表盘）放在GEO的第一位
+      {
+        path: 'geo/dashboard',
+        name: 'GeoDashboard',
+        component: () => import('@/views/geo/Dashboard.vue'),
+        meta: { title: '数据概览', icon: 'PieChart' }, 
+      },
       {
         path: 'geo/projects',
         name: 'GeoProjects',
