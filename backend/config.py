@@ -7,9 +7,13 @@ auto_geo 后端配置
 import os
 from pathlib import Path
 from typing import Literal
+from dotenv import load_dotenv
 
 # ==================== 项目路径 ====================
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 加载环境变量
+load_dotenv(BASE_DIR / ".env")
 DATA_DIR = BASE_DIR / ".cookies"
 DATABASE_DIR = BASE_DIR / "backend" / "database"
 
@@ -132,6 +136,18 @@ N8N_TIMEOUT = 300
 # DeepSeek API配置
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
+
+# ==================== RAGFlow 配置 ====================
+# RAGFlow 服务地址
+RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "http://localhost:9380")
+# RAGFlow API Key
+RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
+# RAGFlow 知识库ID（用于存储采集的文章）
+RAGFLOW_DATASET_ID = os.getenv("RAGFLOW_DATASET_ID", "")
+# RAGFlow 知识库名称（自动创建时使用）
+RAGFLOW_DATASET_NAME = os.getenv("RAGFLOW_DATASET_NAME", "reference_articles_kb")
+# 去重相似度阈值
+RAGFLOW_DUPLICATE_THRESHOLD = float(os.getenv("RAGFLOW_DUPLICATE_THRESHOLD", "0.85"))
 
 # ==================== AI平台检测配置 ====================
 # 收录检测的AI平台列表

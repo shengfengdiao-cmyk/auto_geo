@@ -114,6 +114,38 @@
             </div>
           </div>
 
+          <div class="form-group">
+            <label class="form-label">
+              用户自定义前缀（可选）
+            </label>
+            <div class="input-wrapper">
+              <input
+                v-model="distillForm.prefixes"
+                type="text"
+                class="form-input"
+                placeholder="如：专业 靠谱 知名"
+                :disabled="!currentProject"
+                @keyup.enter="startDistill"
+              >
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">
+              用户自定义后缀（可选）
+            </label>
+            <div class="input-wrapper">
+              <input
+                v-model="distillForm.suffixes"
+                type="text"
+                class="form-input"
+                placeholder="如：哪家好 厂家 服务商"
+                :disabled="!currentProject"
+                @keyup.enter="startDistill"
+              >
+            </div>
+          </div>
+
           <!-- 示例 -->
           <div v-if="!distilling && results.length === 0" class="example-tip">
             <svg viewBox="0 0 16 16" fill="currentColor" width="16">
@@ -417,6 +449,8 @@ const currentKeyword = ref<Keyword | null>(null)
 const distillForm = ref({
   keyword: '',
   company: '',
+  prefixes: '',
+  suffixes: '',
 })
 
 const results = ref<DistillResult[]>([])
@@ -494,9 +528,13 @@ const handleProjectChange = () => {
   if (project) {
     distillForm.value.keyword = project.domain_keyword || ''
     distillForm.value.company = project.company_name || ''
+    distillForm.value.prefixes = ''
+    distillForm.value.suffixes = ''
   } else {
     distillForm.value.keyword = ''
     distillForm.value.company = ''
+    distillForm.value.prefixes = ''
+    distillForm.value.suffixes = ''
   }
   results.value = []
   loadProjectKeywords()
@@ -518,6 +556,10 @@ const startDistill = async () => {
   try {
     const result = await geoKeywordApi.distill({
       project_id: selectedProjectId.value!,
+      core_kw: distillForm.value.keyword,
+      target_info: distillForm.value.company,
+      prefixes: distillForm.value.prefixes,
+      suffixes: distillForm.value.suffixes,
       company_name: distillForm.value.company,
       industry: currentProject.value?.industry || '',
       description: currentProject.value?.description || '',
@@ -863,8 +905,13 @@ onMounted(async () => {
         border: 1px solid #e5e7eb;
         border-radius: 10px;
         font-size: 14px;
-        color: #1a1f36;
+        background: #ffffff !important;
+        color: #111827 !important;
         transition: all 0.2s;
+
+        &::placeholder {
+          color: #9ca3af !important;
+        }
 
         &:focus {
           outline: none;
@@ -873,7 +920,8 @@ onMounted(async () => {
         }
 
         &:disabled {
-          background: #f9fafb;
+          background: #f9fafb !important;
+          color: #6b7280 !important;
           cursor: not-allowed;
         }
 

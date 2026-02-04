@@ -28,7 +28,7 @@ from backend.config import (
     APP_NAME, APP_VERSION, DEBUG, HOST, PORT, RELOAD,
     CORS_ORIGINS, PLATFORMS
 )
-from backend.database import init_db, SessionLocal
+from backend.database import init_db, SessionLocal, get_db
 
 # 导入服务组件
 from backend.services.websocket_manager import ws_manager
@@ -157,6 +157,7 @@ app.include_router(reports.router)
 app.include_router(notifications.router)
 app.include_router(scheduler.router)
 app.include_router(knowledge.router)  # 同事新增的知识库
+app.include_router(article_collection.router) 
 
 
 # ==================== WebSocket 端点 ====================
@@ -219,6 +220,8 @@ async def global_exception_handler(request, exc):
 # ==================== 启动脚本 ====================
 if __name__ == "__main__":
     import uvicorn
+    import asyncio
+    import sys
 
     # Windows 下异步策略优化
     if sys.platform == "win32":

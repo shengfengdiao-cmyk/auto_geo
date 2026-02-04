@@ -21,7 +21,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from backend.database import SessionLocal, init_db
-from backend.database.models import Account, Article, PublishRecord, Project, Keyword
+from backend.database.models import Account, Article, PublishRecord, Project, Keyword, ReferenceArticle
 
 
 # ==================== 配置 ====================
@@ -86,6 +86,7 @@ def clean_db(db):
     db.query(Keyword).delete()
     db.query(Project).delete()
     db.query(Account).delete()
+    db.query(ReferenceArticle).delete()
     db.commit()
 
 
@@ -232,12 +233,35 @@ def test_article(clean_db):
 
 # ==================== Hooks ====================
 
+def pytest_addoption(parser):
+    """添加命令行选项"""
+    parser.addoption(
+        "--real-env",
+        action="store_true",
+        default=False,
+        help="运行真实环境测试（会打开浏览器进行真实抓取）"
+    )
+
+
 def pytest_configure(config):
     """Pytest配置"""
     config.addinivalue_line("markers", "geo: GEO关键词模块测试")
     config.addinivalue_line("markers", "monitor: AI检测监控模块测试")
     config.addinivalue_line("markers", "publish: 文章发布模块测试")
     config.addinivalue_line("markers", "slow: 慢速测试")
+    config.addinivalue_line("markers", "collection: 爆火文章收集模块测试")
+    config.addinivalue_line("markers", "integration: 集成测试（需要启动服务器）")
+    config.addinivalue_line("markers", "real_env: 真实环境测试（需要 --real-env 参数）")
+
+
+def pytest_collection_modifyitems(config, items):
+    """根据命令行选项跳过特定测试"""
+    if not config.getoption("--real-env"):
+        # 如果没有 --real-env 选项，跳过标记为 real_env 的测试
+        skip_real_env = pytest.mark.skip(reason="需要添加 --real-env 参数才能运行真实环境测试")
+        for item in items:
+            if "real_env" in item.keywords:
+                item.add_marker(skip_real_env)
 
 
 def pytest_sessionstart(session):

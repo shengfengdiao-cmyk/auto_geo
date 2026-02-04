@@ -1,0 +1,159 @@
+{
+  "name": "GEO文章生成",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// 1. 获取 AI 生成的原始文本 (Basic LLM Chain 的输出字段是 text)\nconst aiRawText = items[0].json.text;\n\n// 2. 容错处理：去掉 AI 可能带的 ```json 等修饰符\nconst cleanText = aiRawText.replace(/```json/g, \"\").replace(/```/g, \"\").trim();\n\nlet parsedData;\ntry {\n    // 尝试解析 AI 返回的 JSON\n    parsedData = JSON.parse(cleanText);\n} catch (e) {\n    // 如果 AI 没听话，没返回 JSON，我们手动封装一个，防止流程崩溃\n    parsedData = {\n        title: \"关于关键词的深度解析\",\n        content: aiRawText\n    };\n}\n\n// 3. 随机生成 SEO 评分\nconst seoScore = Math.floor(Math.random() * 15) + 85;\n\n// 4. 返回给下一个节点\nreturn [{\n  json: {\n    status: 'success',\n    data: parsedData, // 这里包含了 Python 想要的 title 和 content\n    seo: {\n      score: seoScore,\n      keyword_density: '2.3%',\n      readability_score: 'Good',\n      suggestions: [\n        '建议在第一段出现关键词',\n        '建议添加至少2张图片',\n        '建议增加内部链接'\n      ]\n    },\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "fe930e07-b651-4760-abd4-176b7d3ac103",
+      "name": "解析并添加SEO评分",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=请为关键词“{{ $json.body.keyword }}”撰写一篇深度、专业的 SEO 优化文章。\n\n### 核心要求：\n1. **身份设定**：你是一名拥有 10 年经验的 SEO 营销专家，撰写风格稳重、专业，适合 B2B 企业发布。\n2. **格式要求**：文章必须使用 **Markdown** 格式进行排版，包含 H1 标题、H2/H3 小标题。\n3. **图文并茂（安全加固版）**：\n   - 请在文章的第 1、第 2 和第 3 个 H2 小标题下方，分别插入一张相关的配图。\n   - 图片语法严格使用：`![描述](https://loremflickr.com/800/450/{关键词},business,office/all)`\n   - 🌟 **配图关键词约束**：\n     *   将 `{关键词}` 替换为 1 个具体的英文实物词（如：truck, office, skyscraper, desk, computer）。\n     *   **严禁使用**可能引起误解或返回血腥内容的词，如：service, help, blood, surgery, dead。\n     *   **强制后缀**：必须保持 `,business,office/all` 结尾，这会确保图片在你的关键词基础上，必须同时带有“商务”和“办公”标签，从而过滤掉非专业画面。\n4. **字数要求**：正文内容在 800-1200 字之间。\n\n### 输出格式：\n你必须**严格只返回**以下标准的 JSON 格式，不要包含任何多余的解释文字、不要包含 Markdown 的代码块标识符（如 ```json ）：\n{\n  \"title\": \"文章标题\",\n  \"content\": \"这里是完整的 Markdown 正文，图片链接必须按照上述格式插入\"\n}",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1232,
+        400
+      ],
+      "id": "d4d85c84-dee0-4bd5-80cf-5af5591e40d5",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": "deepseek-reasoner",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatDeepSeek",
+      "typeVersion": 1,
+      "position": [
+        1184,
+        656
+      ],
+      "id": "b1c9f769-ec0f-4ab0-9136-f42705278ab5",
+      "name": "DeepSeek Chat Model",
+      "credentials": {
+        "deepSeekApi": {
+          "id": "DD6Ip4ADoauR1zhE",
+          "name": "DeepSeek account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "geo-article-generate",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1597db3a-53ef-461e-985d-e7794e85373d",
+      "name": "Webhook接收1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        896,
+        384
+      ],
+      "webhookId": "geo-article-generate"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "652fa6c1-71fc-4432-997d-0636858ec0e8",
+      "name": "返回响应1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1792,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "content": "# 文章生成模块 \n## 注意事项\n1. 配置好deepseek 秘钥",
+        "height": 688,
+        "width": 1232
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        800,
+        192
+      ],
+      "typeVersion": 1,
+      "id": "6ebec062-1006-4c77-923a-b921b8fa76e7",
+      "name": "Sticky Note"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "解析并添加SEO评分": {
+      "main": [
+        [
+          {
+            "node": "返回响应1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DeepSeek Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "解析并添加SEO评分",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook接收1": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "27f15556-8283-437d-a752-3a168d451771",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1454a25a818a408608752897974c1be4f32e6918b1933f542fe2a05bb14e6267"
+  },
+  "id": "EuoKDXYWdt_8lubZ46SHQ",
+  "tags": []
+}

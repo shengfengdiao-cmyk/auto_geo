@@ -69,23 +69,42 @@ class KeywordService:
         self.db.refresh(new_qv)
         return new_qv
 
-    async def distill(self, company_name: str, industry: str, description: str, count: int = 10) -> Dict[str, Any]:
+    async def distill(
+            self,
+            *,
+            core_kw: str,
+            target_info: str,
+            prefixes: str = "",
+            suffixes: str = "",
+            company_name: str = "",
+            industry: str = "",
+            description: str = "",
+            count: int = 10
+    ) -> Dict[str, Any]:
         """
         🌟 核心方法：执行关键词蒸馏 (调用 n8n)
         修正了之前的 404 错误，对接标准 webhook 路径
         """
-        logger.info(f"🧪 开始关键词蒸馏: {company_name} - {industry}")
+        logger.info(f"🧪 开始关键词蒸馏: {core_kw} - {target_info}")
 
-        # 构造发给 AI 的 Prompt 上下文
-        # 注意：这里我们把多个字段合并成一个列表传给 n8n，适配 n8n_service 的接口
-        input_keywords_list = [f"公司:{company_name}", f"行业:{industry}", f"业务:{description}"]
+        # 兼容旧调用：如果没有传 core_kw/target_info，则退化为旧版拼装
+        legacy_keywords_list = [f"公司:{company_name}", f"行业:{industry}", f"业务:{description}"]
 
         try:
             # 1. 获取服务单例
             n8n = await get_n8n_service()
 
             # 2. 调用 /webhook/keyword-distill
-            result = await n8n.distill_keywords(input_keywords_list, project_id=None)
+            if core_kw and target_info:
+                result = await n8n.distill_keywords(
+                    core_kw=core_kw,
+                    target_info=target_info,
+                    prefixes=prefixes or None,
+                    suffixes=suffixes or None,
+                    project_id=None
+                )
+            else:
+                result = await n8n.distill_keywords(keywords=legacy_keywords_list, project_id=None)
 
             if result.status == "success":
                 logger.success(f"✅ n8n 响应成功")

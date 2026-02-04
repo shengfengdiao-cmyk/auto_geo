@@ -80,7 +80,14 @@ class QuestionVariantResponse(BaseModel):
 class DistillRequest(BaseModel):
     """关键词蒸馏请求"""
     project_id: int
-    company_name: str
+    # 通用版入参（对齐 n8n "AutoGeo-关键词蒸馏-通用版"）
+    core_kw: Optional[str] = None
+    target_info: Optional[str] = None
+    prefixes: Optional[str] = None
+    suffixes: Optional[str] = None
+
+    # 旧版兼容字段（前端历史版本仍可能发送）
+    company_name: Optional[str] = None
     industry: Optional[str] = None
     description: Optional[str] = None
     count: int = 10
@@ -143,11 +150,20 @@ async def distill_keywords(request: DistillRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="项目不存在")
 
     service = KeywordService(db)
+
+    # 参数映射：优先使用通用版字段；否则从项目/旧字段推导
+    core_kw = (request.core_kw or "").strip() or (project.domain_keyword or "").strip()
+    target_info = (request.target_info or "").strip() or (request.company_name or "").strip() or (project.company_name or "").strip()
+
     result = await service.distill(
-        company_name=request.company_name,
-        industry=request.industry or "",
-        description=request.description or "",
-        count=request.count
+        core_kw=core_kw,
+        target_info=target_info,
+        prefixes=(request.prefixes or "").strip(),
+        suffixes=(request.suffixes or "").strip(),
+        company_name=(request.company_name or "").strip(),
+        industry=(request.industry or "").strip(),
+        description=(request.description or "").strip(),
+        count=request.count,
     )
 
     if result.get("status") == "error":

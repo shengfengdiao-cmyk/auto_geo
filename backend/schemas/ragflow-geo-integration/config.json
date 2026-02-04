@@ -1,0 +1,15 @@
+{
+  "ragflow_config": {
+    "base_url": "http://your-ragflow-host:port",
+    "api_key": "your_actual_api_key_here",
+    "dataset_id": "your_actual_dataset_id_here"
+  },
+  "search_params": {
+    "top_k": 5,
+    "similarity_threshold": 0.3
+  },
+  "connection": {
+    "timeout": 30,
+    "retries": 3
+  }
+}

@@ -30,8 +30,15 @@ class N8nConfig:
 # ==================== 请求模型 ====================
 
 class KeywordDistillRequest(BaseModel):
-    keywords: List[str]
+    # 兼容旧版：以列表形式传递上下文
+    keywords: Optional[List[str]] = None
     project_id: Optional[int] = None
+
+    # 通用版：适配 n8n "AutoGeo-关键词蒸馏-通用版" 工作流
+    core_kw: Optional[str] = None
+    target_info: Optional[str] = None
+    prefixes: Optional[str] = None
+    suffixes: Optional[str] = None
 
 
 class GenerateQuestionsRequest(BaseModel):
@@ -160,10 +167,28 @@ class N8nService:
 
     # ==================== 业务方法 ====================
 
-    async def distill_keywords(self, keywords: List[str], project_id: Optional[int] = None) -> N8nResponse:
+    async def distill_keywords(
+            self,
+            *,
+            core_kw: Optional[str] = None,
+            target_info: Optional[str] = None,
+            prefixes: Optional[str] = None,
+            suffixes: Optional[str] = None,
+            keywords: Optional[List[str]] = None,
+            project_id: Optional[int] = None
+    ) -> N8nResponse:
         """关键词蒸馏"""
         self.log.info(f"🧹 正在蒸馏提纯关键词...")
-        payload = KeywordDistillRequest(keywords=keywords, project_id=project_id).model_dump()
+
+        payload = KeywordDistillRequest(
+            keywords=keywords,
+            project_id=project_id,
+            core_kw=core_kw,
+            target_info=target_info,
+            prefixes=prefixes,
+            suffixes=suffixes,
+        ).model_dump(exclude_none=True)
+
         return await self._call_webhook("keyword-distill", payload)
 
     async def generate_questions(self, question: str, count: int = 10) -> N8nResponse:
