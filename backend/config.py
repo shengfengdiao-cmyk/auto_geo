@@ -129,10 +129,25 @@ MAX_RETRY_COUNT = 2
 RETRY_INTERVAL = 5
 
 # ==================== n8n配置 ====================
-# n8n webhook基础URL
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "http://localhost:5678/webhook")
+# 🌟 n8n webhook 基础 URL (用于构建特定端点的完整 URL)
+BASE_WEBHOOK = os.getenv("N8N_WEBHOOK_URL", "http://localhost:5678/webhook")
+
+# 🌟 关键词蒸馏 Webhook URL (如果未单独配置，自动补全 /keyword-distill 后缀)
+# 原则：特定的 Webhook URL 必须包含其特定的路径后缀
+N8N_DISTILL_WEBHOOK_URL = os.getenv(
+    "N8N_DISTILL_WEBHOOK_URL",
+    f"{BASE_WEBHOOK}/keyword-distill"
+)
+
+# 🌟 文章生成 Webhook URL (如果未单独配置，自动补全 /geo-article-generate 后缀)
+N8N_GENERATE_WEBHOOK_URL = os.getenv(
+    "N8N_GENERATE_WEBHOOK_URL",
+    f"{BASE_WEBHOOK}/geo-article-generate"
+)
+
 # n8n工作流超时时间（秒）
 N8N_TIMEOUT = 300
+
 # DeepSeek API配置
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")

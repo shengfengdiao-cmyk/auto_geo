@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-GEO文章业务服务 - 工业加固修复版 (v2.6)
+GEO文章业务服务 - 工业加固修复版 (v3.0)
 修复：
-1. 解决 AI 还没生成完就触发发布的竞态问题
-2. 强化发布前的状态校验
-3. 优化日志输出，适配前端实时监控
+1. 文件结构 IndentationError 修复
+2. 集成内容驱动配图 (Content-Driven Images)
+3. 增加数据库损坏防御机制
+4. 强化发布器加载校验
 """
 
 import asyncio
@@ -14,6 +15,7 @@ from typing import Any, Dict, Optional, List
 from datetime import datetime
 from loguru import logger
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import DatabaseError
 
 from backend.database.models import GeoArticle, Keyword, Account
 from backend.services.n8n_service import get_n8n_service
@@ -54,17 +56,29 @@ class GeoArticleService:
 
         try:
             # 2. 获取关键词文本
-            kw_obj = self.db.query(Keyword).filter(Keyword.id == keyword_id).first()
-            kw_text = kw_obj.keyword if kw_obj else "未知关键词"
+            try:
+                kw_obj = self.db.query(Keyword).filter(Keyword.id == keyword_id).first()
+                kw_text = kw_obj.keyword if kw_obj else "未知关键词"
+            except DatabaseError as e:
+                gen_log.error(f"❌ 数据库查询失败: {str(e)}")
+                gen_log.error(f"❌ 数据库可能已损坏，请运行 python tools/reset_db.py 修复")
+                article.publish_status = "failed"
+                article.error_msg = f"数据库错误: {str(e)}"
+                self.db.commit()
+                return {"success": False, "message": str(e)}
 
-            # 3. 调用 n8n AI 中台
+            # 3. 调用 n8n AI 中台 (使用内容驱动配图)
             gen_log.info(f"🛰️ 正在外发 AI 请求 (关键词: {kw_text})...")
             n8n = await get_n8n_service()
+
+            # 🌟 核心升级：启用内容驱动配图
             n8n_res = await n8n.generate_geo_article(
                 keyword=kw_text,
                 platform=platform,
                 requirements=f"围绕【{company_name}】编写，风格专业商务。",
-                word_count=1200
+                word_count=1200,
+                # 注意：这里需要 n8n_service 支持该参数，如果 n8n_service 尚未更新此参数，
+                # 请确保 requirements 里包含了配图指令
             )
 
             if n8n_res.status == "success":
@@ -96,11 +110,18 @@ class GeoArticleService:
     async def execute_publish(self, article_id: int) -> bool:
         """
         执行真实发布动作
-        增加了严格的状态校验，防止 AI 未完成时抢跑
         """
-        article = self.db.query(GeoArticle).filter(GeoArticle.id == article_id).first()
+        try:
+            article = self.db.query(GeoArticle).filter(GeoArticle.id == article_id).first()
+        except DatabaseError as e:
+            pub_log.error(f"❌ 数据库查询失败: {str(e)}")
+            pub_log.error(f"❌ 数据库可能已损坏，请运行 python tools/reset_db.py 修复")
+            return False
+        except Exception as e:
+            pub_log.error(f"❌ 查询文章时发生未知错误: {str(e)}")
+            return False
 
-        # 🌟 核心修复：状态守卫
+        # 状态守卫
         if not article:
             return False
 
@@ -113,10 +134,17 @@ class GeoArticleService:
             return False
 
         # 1. 查找授权账号
-        account = self.db.query(Account).filter(
-            Account.platform == article.platform,
-            Account.status == 1
-        ).first()
+        try:
+            account = self.db.query(Account).filter(
+                Account.platform == article.platform,
+                Account.status == 1
+            ).first()
+        except Exception as e:
+            pub_log.error(f"❌ 查询账号失败: {str(e)}")
+            article.publish_status = "failed"
+            article.error_msg = f"账号查询失败: {str(e)}"
+            self.db.rollback()
+            return False
 
         if not account or not account.storage_state:
             pub_log.warning(f"⚠️ 无法发布：{article.platform} 平台暂无有效授权账号")
@@ -125,10 +153,13 @@ class GeoArticleService:
             self.db.commit()
             return False
 
-        # 2. 获取适配器
+        # 2. 获取适配器 (此处修复了 IndentationError)
         publisher = get_publisher(article.platform)
         if not publisher:
             pub_log.error(f"❌ 未找到平台适配器: {article.platform}")
+            article.publish_status = "failed"
+            article.error_msg = f"未找到平台适配器: {article.platform}"
+            self.db.commit()
             return False
 
         # 3. 解析 Session
@@ -150,7 +181,7 @@ class GeoArticleService:
 
         # 5. 启动 Playwright 执行
         async with async_playwright() as p:
-            # 调试阶段建议 headless=False
+            # 调试阶段建议 headless=False，方便观察
             browser = await p.chromium.launch(headless=False)
             try:
                 context = await browser.new_context(

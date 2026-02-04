@@ -5,6 +5,7 @@ Playwright发布适配器模块
 """
 
 from .base import BasePublisher, PublisherRegistry, registry, get_publisher, list_publishers
+from loguru import logger
 from .zhihu import ZhihuPublisher
 from .baijiahao import BaijiahaoPublisher
 from .sohu import SohuPublisher

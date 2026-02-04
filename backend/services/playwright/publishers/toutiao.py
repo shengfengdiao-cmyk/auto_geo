@@ -17,7 +17,7 @@ import urllib.parse
 from typing import Dict, Any, List, Optional
 from playwright.async_api import Page
 from loguru import logger
-from .base import BasePublisher, registry
+from .base import BasePublisher, registry, ImageDownloadManager
 
 
 class ToutiaoPublisher(BasePublisher):
@@ -51,15 +51,29 @@ class ToutiaoPublisher(BasePublisher):
 
                 logger.info(f"✅ AI 已生成 {len(image_urls)} 张配图链接")
 
-            # 下载图片
-            downloaded_paths = await self._download_images_fast(image_urls)
+            # 下载图片 (使用 ImageDownloadManager 的智能重试机制)
+            img_manager = ImageDownloadManager()
+            download_result = await img_manager.download_images(image_urls)
+            downloaded_paths = download_result["paths"]
             temp_files.extend(downloaded_paths)
 
-            if not downloaded_paths:
-                logger.error("❌ 图片下载失败，无法继续发布")
-                return {"success": False, "error_msg": "图片下载失败"}
+            # 🌟 优雅降级：根据下载结果决定是否继续
+            if download_result["mode"] == "text_only":
+                # 纯文字发布模式 - 不包含图片
+                logger.warning("⚠️ 图片全部下载失败，继续纯文字发布")
+                image_urls = []  # 清空图片列表
+                downloaded_paths = []
+            elif download_result["mode"] == "partial_image":
+                # 部分图片模式 - 部分图片已下载
+                logger.warning(f"⚠️ 部分图片下载失败 ({download_result['failed_count']}/{len(image_urls)})，继续发布已下载的 {len(downloaded_paths)} 张图片")
+            elif download_result["mode"] == "full_image":
+                # 完整图片模式 - 所有图片下载成功
+                logger.success(f"✅ 成功下载 {len(downloaded_paths)} 张图片")
+                logger.info(f"📊 使用的图片服务: {download_result['service_used']}")
 
-            logger.info(f"✅ 成功下载 {len(downloaded_paths)} 张图片")
+            # 如果所有图片下载失败，仍继续发布（不中断流程）
+            if not downloaded_paths:
+                logger.warning("⚠️ 图片下载完全失败，继续纯文字发布")
 
             # --- 🌟 修复后的执行顺序 ---
 
