@@ -1,0 +1,23 @@
+[
+  {
+    "id": 1,
+    "city": "北京",
+    "keyword": "高端写字楼搬迁",
+    "cron_time": "09:30",
+    "description": "针对北京地区的办公搬家业务"
+  },
+  {
+    "id": 2,
+    "city": "上海",
+    "keyword": "家庭深度保洁",
+    "cron_time": "14:00",
+    "description": "针对上海高品质社区的保洁业务"
+  },
+  {
+    "id": 3,
+    "city": "广州",
+    "keyword": "空调清洗维护",
+    "cron_time": "16:45",
+    "description": "季节性家电维护业务"
+  }
+]
