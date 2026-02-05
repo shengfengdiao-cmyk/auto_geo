@@ -101,7 +101,9 @@ class ToutiaoPublisher(BasePublisher):
                 await page.mouse.click(450, 220)
 
                 # 3. 物理按键清空并输入
-            await page.keyboard.press("Control+A")
+            # 跨平台兼容：Mac 使用 Meta，Windows 使用 Control
+            modifier = "Meta" if "Mac" in await page.evaluate("navigator.platform") else "Control"
+            await page.keyboard.press(f"{modifier}+A")
             await page.keyboard.press("Backspace")
             await page.keyboard.type(title, delay=30)
             await page.keyboard.press("Tab")

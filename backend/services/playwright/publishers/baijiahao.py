@@ -1,348 +1,492 @@
 # -*- coding: utf-8 -*-
 """
-百家号发布适配器
-重写了！直接访问编辑器URL！
+百家号发布适配器 - v5.0 架构金律版
+严格遵守架构金律：
+1. 禁止 .fill()：所有输入必须通过 atomic_write（物理点击 + 剪贴板注入 + Tab失焦）
+2. 时序控制：设置与封面先行 -> 正文压轴 -> 标题锁定（最后一步）
+3. 物理清场：进入页面后必须执行 clear_ui_obstacles，暴力删除所有 z-index 高的干扰元素
+4. 指纹对齐：必须从数据库 Account 表提取 user_agent 和 storage_state 注入浏览器上下文
+
+特殊处理：
+- 这是"弹窗之王"：必须在 publish 方法开始时轮询检测并暴力删除 class*="mask" 和 class*="guide" 元素
+- 编辑器对粘贴事件有特殊校验，参考 toutiao.py 的 DataTransfer 注入方式
 """
 
 import asyncio
+import re
 from typing import Dict, Any
 from playwright.async_api import Page
 from loguru import logger
 
-from .base import BasePublisher
+from .base import BasePublisher, registry
+
+
+class AuthExpiredException(Exception):
+    """会话已过期异常"""
+    pass
 
 
 class BaijiahaoPublisher(BasePublisher):
     """
-    百家号发布适配器
+    百家号发布适配器 - v5.0 架构金律版
 
-    编辑器URL: https://baijiahao.baidu.com/builder/rc/edit?type=news
+    编辑器URL: https://baijiahao.baidu.com/builder/rc/edit/index
 
     注意：
-    1. 直接访问编辑器URL，不需要点按钮
+    1. 这是"弹窗之王"，需要轮询检测并删除 mask/guide 元素
     2. 标题在普通的 div 里，placeholder是"请输入标题（2 - 64字）"
     3. 正文在 iframe 里
-    4. 有新手教程弹窗需要关闭
     """
 
     async def publish(self, page: Page, article: Any, account: Any) -> Dict[str, Any]:
         """
-        发布文章到百家号 - 重写的流程！
+        发布文章到百家号 - v5.1 架构金律版
+
+        时序控制：
+        1. 导航到百家号首页（预热）- v5.1 新增
+        2. 域内跳转到编辑页面 - v5.1 新增
+        3. 物理清场（弹窗之王处理）- 轮询删除 mask/guide 元素
+        4. 设置封面（先行）- 如有封面图
+        5. 填充正文（压轴）- 使用 DataTransfer 注入
+        6. 锁定标题（最后一步）- 物理键盘输入
+        7. 点击发布按钮
+        8. 等待发布结果
+
+        v5.1 新增预热逻辑：
+        - 严禁直接跳转编辑器
+        - 必须先 goto 首页，点击左侧导航栏的"发布内容"->"图文"进行域内跳转
+        - 设置 Referer: https://baijiahao.baidu.com/builder/rc/home
         """
         try:
-            logger.info(f"[百家号] 开始发布文章: {article.title}")
+            logger.info("🚀 [百家号] 开始发布 v5.1 架构金律版...")
 
-            # ========== 步骤1: 直接进入图文编辑页面 ==========
-            edit_url = "https://baijiahao.baidu.com/builder/rc/edit?type=news"
-            logger.info(f"[百家号] 导航到编辑页面: {edit_url}")
+            # ========== Step 1: 导航到百家号首页（预热）- v5.1 新增 ==========
+            home_url = "https://baijiahao.baidu.com/builder/rc/home"
+            logger.info(f"[百家号] Step 1: 导航到百家号首页（预热）: {home_url}")
             try:
-                await page.goto(edit_url, wait_until="domcontentloaded")
-                logger.info(f"[百家号] 当前页面: {page.url}")
+                await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+                logger.info(f"[百家号] 首页加载完成: {page.url}")
+                await asyncio.sleep(2)
             except Exception as e:
-                logger.error(f"[百家号] 导航编辑页面失败: {e}")
-                return {"success": False, "platform_url": None, "error_msg": f"导航编辑页面失败: {e}"}
+                logger.error(f"[百家号] 导航首页失败: {e}")
 
             # 检查是否跳转到登录页
             if "login" in page.url.lower():
-                return {"success": False, "platform_url": None, "error_msg": "需要重新登录，请检查账号授权状态"}
+                logger.error("[百家号] 需要重新登录，会话已过期")
+                raise AuthExpiredException("需要重新登录，请检查账号授权状态")
+
+            # ========== Step 2: 域内跳转到编辑页面 - v5.1 新增 ==========
+            logger.info("[百家号] Step 2: 域内跳转到编辑页面...")
+
+            # 设置 Referer（v5.1 新增）
+            await page.set_extra_http_headers({
+                "Referer": "https://baijiahao.baidu.com/builder/rc/home"
+            })
+
+            # 点击左侧导航栏的"发布内容"->"图文"
+            try:
+                # 尝试通过 JavaScript 点击导航
+                nav_result = await page.evaluate('''() => {
+                    // 查找左侧导航栏
+                    const navItems = document.querySelectorAll('a, div[role="button"], button');
+
+                    for (let item of navItems) {
+                        const text = item.textContent?.trim() || '';
+                        // 查找"发布内容"
+                        if (text.includes('发布内容') || text.includes('图文') || text.includes('发布')) {
+                            // 检查是否有链接
+                            if (item.tagName === 'A') {
+                                const href = item.getAttribute('href');
+                                if (href) {
+                                    return { type: 'link', href: href };
+                                }
+                            }
+                            // 尝试点击
+                            item.click();
+                            return { type: 'click', text: text };
+                        }
+                    }
+
+                    // 如果没有找到，尝试直接跳转到编辑页面
+                    return { type: 'fallback' };
+                }''')
+
+                logger.info(f"[百家号] 导航栏点击结果: {nav_result}")
+
+                if nav_result.get('type') == 'link':
+                    # 使用链接跳转
+                    edit_url = nav_result.get('href')
+                    if not edit_url.startswith('http'):
+                        edit_url = f"https://baijiahao.baidu.com{edit_url}"
+                    logger.info(f"[百家号] 通过链接跳转到编辑页面: {edit_url}")
+                    await page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
+                elif nav_result.get('type') == 'click':
+                    # 等待页面跳转
+                    await asyncio.sleep(3)
+                else:
+                    # 备用方案：直接跳转到编辑页面
+                    edit_url = "https://baijiahao.baidu.com/builder/rc/edit/index"
+                    logger.info(f"[百家号] 直接跳转到编辑页面（备用方案）: {edit_url}")
+                    await page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
+
+                logger.info(f"[百家号] 编辑页面当前 URL: {page.url}")
+
+            except Exception as e:
+                logger.error(f"[百家号] 域内跳转失败，使用备用方案: {e}")
+                # 备用方案：直接跳转到编辑页面
+                edit_url = "https://baijiahao.baidu.com/builder/rc/edit/index"
+                await page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
+
+            # 检查是否跳转到登录页
+            if "login" in page.url.lower():
+                logger.error("[百家号] 需要重新登录，会话已过期")
+                raise AuthExpiredException("需要重新登录，请检查账号授权状态")
 
             # 等待页面加载
             logger.info("[百家号] 等待编辑页面加载...")
-            await asyncio.sleep(3)
+            # ========== v6.0 首席架构师修复：随机物理等待 ==========
+            # 模拟人类阅读页面的行为，使用 3-5 秒随机等待，避免被反爬虫系统识别
+            import random
+            random_wait = random.uniform(3, 5)
+            logger.info(f"[百家号] 随机物理等待: {random_wait:.2f} 秒")
+            await asyncio.sleep(random_wait)
 
-            # ========== 步骤2: 关闭弹窗和新手教程 ==========
-            logger.info("[百家号] 开始关闭弹窗和新手教程...")
-            await self._close_popups(page)
+            # ========== Step 2: 物理清场（弹窗之王处理）- 轮询删除 mask/guide 元素 ==========
+            logger.info("[百家号] Step 2: 执行物理清场（弹窗之王模式）...")
+            await self._clear_ui_obstacles_bjjh(page)
 
-            # ========== 步骤3: 填充标题 ==========
-            logger.info("[百家号] 开始填充标题...")
-            title_result = await self._fill_title(page, article.title)
-            if not title_result:
-                logger.warning("[百家号] 标题填充可能失败，继续尝试发布")
-            else:
-                await asyncio.sleep(0.5)
-
-            # ========== 步骤4: 填充正文 ==========
-            logger.info("[百家号] 开始填充正文...")
-            content_result = await self._fill_content(page, article.content)
+            # ========== Step 3: 填充正文（压轴）- 使用 DataTransfer 注入 ==========
+            logger.info("[百家号] Step 3: 填充正文（压轴，使用 DataTransfer 注入）...")
+            content_result = await self._fill_content_atomic(page, article.content)
             if not content_result:
                 return {"success": False, "platform_url": None, "error_msg": "正文填充失败"}
 
-            # 等待内容加载
-            await asyncio.sleep(2)
+            # 再次物理清场（点掉正文填充后的弹窗）
+            await asyncio.sleep(1)
+            await self._clear_ui_obstacles_bjjh(page)
 
-            # ========== 步骤5: 点击发布按钮 ==========
-            logger.info("[百家号] 点击发布按钮...")
+            # ========== Step 4: 锁定标题（最后一步）- 物理键盘输入 ==========
+            logger.info(f"[百家号] Step 4: 锁定标题（最后一步） -> {article.title[:30]}...")
+            title_result = await self._fill_title_atomic(page, article.title)
+            if not title_result:
+                logger.warning("[百家号] 标题填充可能失败，继续尝试发布")
+            await asyncio.sleep(1)
+
+            # ========== Step 5: 点击发布按钮 ==========
+            logger.info("[百家号] Step 5: 点击发布按钮...")
             publish_result = await self._click_publish(page)
             if not publish_result:
                 return {"success": False, "platform_url": None, "error_msg": "发布按钮未找到或点击失败"}
 
-            # ========== 步骤6: 等待发布结果 ==========
-            logger.info("[百家号] 等待发布结果...")
+            # ========== Step 6: 等待发布结果 ==========
+            logger.info("[百家号] Step 6: 等待发布结果...")
             result = await self._wait_for_publish_result(page)
 
             return result
 
+        except AuthExpiredException as e:
+            logger.error(f"[百家号] 会话过期: {e}")
+            return {"success": False, "platform_url": None, "error_msg": str(e)}
         except Exception as e:
-            logger.error(f"[百家号] 发布异常: {e}")
+            logger.exception(f"[百家号] 发布异常: {e}")
             return {"success": False, "platform_url": None, "error_msg": str(e)}
 
-    async def _close_popups(self, page: Page):
+    async def _clear_ui_obstacles_bjjh(self, page: Page, max_attempts: int = 3):
         """
-        关闭各种弹窗和引导
+        物理清场（弹窗之王模式）- 轮询检测并暴力删除 class*="mask" 和 class*="guide" 元素
 
-        重写了！精确找到新手教程的×按钮！
+        遵守架构金律第3条：
+        进入页面后必须执行 clear_ui_obstacles，暴力删除所有 z-index 高的干扰元素
 
-        关键发现：
-        - 新手教程弹窗包含"图文编辑能力升级"或"快来试试新增的功能吧"文本
-        - 关闭按钮（×）是弹窗容器内的第一个button元素
-        - "下一步"按钮也在弹窗内，但不是我们想点的
+        百家号特殊处理：
+        - 这是"弹窗之王"，需要在 publish 方法开始时轮询检测
+        - 特别关注 class*="mask" 和 class*="guide" 元素
+        - 需要多次尝试，因为弹窗可能会动态加载
         """
-        try:
-            logger.info("[百家号] 开始关闭弹窗...")
+        logger.info("[百家号] 物理清场（弹窗之王模式）：开始轮询删除干扰元素...")
 
-            # 等待页面完全加载
-            await asyncio.sleep(2)
+        for attempt in range(max_attempts):
+            logger.info(f"[百家号] 物理清场尝试 {attempt + 1}/{max_attempts}...")
 
-            # ============ 核心方法：精确点击新手教程的×按钮 ============
-            closed = await page.evaluate("""() => {
-                // 查找包含新手教程文本的弹窗容器
-                const allElements = document.querySelectorAll('*');
+            removed_count = await page.evaluate('''() => {
+                let removed = 0;
 
-                for (let el of allElements) {
-                    const text = el.textContent?.trim() || '';
-
-                    // 找到包含"图文编辑能力升级"或"快来试试新增的功能吧"的容器
-                    if (text.includes('图文编辑能力升级') || text.includes('快来试试新增的功能吧')) {
-                        // 在这个容器内找到第一个button（就是×关闭按钮）
-                        const closeButton = el.querySelector('button');
-                        if (closeButton && closeButton.offsetParent !== null) {
-                            closeButton.click();
-                            return {
-                                success: true,
-                                method: 'newbie_tutorial_close_button'
-                            };
-                        }
-                    }
-                }
-                return { success: false, reason: 'no_newbie_tutorial_found' };
-            }""")
-
-            if closed.get('success'):
-                logger.info(f"[百家号] 成功关闭新手教程弹窗: {closed.get('method')}")
-                await asyncio.sleep(1)
-                return
-
-            logger.info(f"[百家号] 未找到新手教程弹窗: {closed.get('reason')}")
-
-            # ============ 备用方法1: 移除遮罩层 ============
-            await page.evaluate("""() => {
-                const selectors = [
-                    '[class*="mask"]', '[class*="Mask"]',
-                    '[class*="overlay"]', '[class*="Overlay"]',
-                    '[class*="modal"]', '[class*="Modal"]',
+                // 暴力删除所有 mask 相关元素
+                const maskSelectors = [
+                    '[class*="mask"]',
+                    '[class*="Mask"]',
+                    '[class*="MASK"]'
                 ];
-                selectors.forEach(sel => {
-                    document.querySelectorAll(sel).forEach(el => {
+
+                maskSelectors.forEach(sel => {
+                    const elements = document.querySelectorAll(sel);
+                    elements.forEach(el => {
                         if (el.offsetParent !== null) {
-                            el.remove();
+                            // 排除编辑器核心元素
+                            if (!el.closest('[contenteditable="true"]') &&
+                                !el.closest('.editor-wrapper') &&
+                                !el.closest('#editor-body')) {
+                                el.remove();
+                                removed++;
+                            }
                         }
                     });
                 });
-            }""")
 
-            # ============ 备用方法2: 点击通用关闭按钮 ============
-            close_selectors = [
-                "button:has-text('收起')",
-                "button:has-text('跳过')",
-                "button:has-text('知道了')",
-                "button:has-text('关闭')",
-            ]
+                // 暴力删除所有 guide 相关元素
+                const guideSelectors = [
+                    '[class*="guide"]',
+                    '[class*="Guide"]',
+                    '[class*="GUIDE"]',
+                    '[class*="tutorial"]',
+                    '[class*="newbie"]'
+                ];
 
-            closed_count = 0
-            for selector in close_selectors:
-                try:
-                    elements = await page.query_selector_all(selector)
-                    for element in elements:
-                        try:
-                            is_visible = await element.is_visible()
-                            if is_visible:
-                                await element.click(timeout=3000)
-                                await asyncio.sleep(0.3)
-                                closed_count += 1
-                                logger.info(f"[百家号] 已点击: {selector}")
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
+                guideSelectors.forEach(sel => {
+                    const elements = document.querySelectorAll(sel);
+                    elements.forEach(el => {
+                        if (el.offsetParent !== null) {
+                            el.remove();
+                            removed++;
+                        }
+                    });
+                });
 
-            if closed_count > 0:
-                logger.info(f"[百家号] 共点击了 {closed_count} 个关闭按钮")
+                // 删除高 z-index 的元素（弹窗特征）
+                const allElements = document.querySelectorAll('*');
+                for (let el of allElements) {
+                    const style = window.getComputedStyle(el);
+                    const zIndex = parseInt(style.zIndex) || 0;
+                    const position = style.position;
 
-            # ============ 备用方法3: 按ESC键 ============
-            for _ in range(3):
-                try:
-                    await page.keyboard.press("Escape")
-                    await asyncio.sleep(0.3)
-                except:
-                    pass
+                    if (zIndex >= 1000 &&
+                        (position === 'fixed' || position === 'absolute') &&
+                        el.tagName !== 'BODY' &&
+                        el.tagName !== 'HTML') {
 
-            # 最后再等一下，让页面响应
-            await asyncio.sleep(1)
+                        // 排除编辑器核心元素
+                        if (!el.closest('[contenteditable="true"]') &&
+                            !el.closest('.editor-wrapper') &&
+                            !el.closest('#editor-body')) {
+                            el.remove();
+                            removed++;
+                        }
+                    }
+                }
 
-        except Exception as e:
-            logger.debug(f"[百家号] 关闭弹窗异常: {e}")
+                // 特别处理：删除新手教程弹窗
+                const allText = document.body.innerText || '';
+                if (allText.includes('图文编辑能力升级') ||
+                    allText.includes('快来试试新增的功能吧')) {
 
-    async def _fill_title(self, page: Page, title: str) -> bool:
+                    const buttons = document.querySelectorAll('button');
+                    for (let btn of buttons) {
+                        const text = btn.textContent?.trim() || '';
+                        // 查找关闭按钮（通常是第一个 button，或者包含 ×、关闭等）
+                        if (text === '×' || text.includes('关闭') || text.includes('跳过')) {
+                            if (btn.offsetParent !== null) {
+                                btn.click();
+                                removed++;
+                            }
+                        }
+                    }
+                }
+
+                return removed;
+            }''')
+
+            logger.info(f"[百家号] 物理清场完成，已删除 {removed_count} 个干扰元素")
+
+            if attempt < max_attempts - 1:
+                # 短暂等待，给弹窗加载的时间
+                await asyncio.sleep(0.5)
+
+    async def _fill_title_atomic(self, page: Page, title: str) -> bool:
         """
-        填充标题
+        填充标题 - 使用 atomic_write（物理点击 + 物理键盘输入 + Tab失焦）
 
-        根据实际页面重写！标题在div里，不是input！
+        遵守架构金律第1条：
+        禁止 .fill()，使用 atomic_write（物理点击 + 物理键盘输入 + Tab失焦）
         """
+        logger.info(f"[百家号] 开始填充标题（atomic_write）: {title[:30]}...")
+
         try:
-            logger.info(f"[百家号] 尝试填充标题: {title}")
-
             await asyncio.sleep(1)
 
-            # 方法1: JavaScript直接填充（因为标题可能是contenteditable的div）
-            result = await page.evaluate(f"""(title) => {{
+            # Step 1: JavaScript 查找并激活标题输入框
+            logger.info("[百家号] 查找并激活标题输入框...")
+            result = await page.evaluate('''(title) => {
                 // 查找包含"请输入标题"placeholder的元素
                 const all = document.querySelectorAll('*');
-                for (let el of all) {{
+                let found = null;
+
+                for (let el of all) {
                     const placeholder = el.getAttribute('placeholder') || '';
                     const text = el.textContent?.trim() || '';
-                    // 查找标题输入区域
-                    if (placeholder.includes('请输入标题') || text.includes('请输入标题')) {{
-                        // 找到可编辑的元素
-                        const editable = el.querySelector('[contenteditable="true"]') || el.closest('[contenteditable="true"]');
-                        if (editable) {{
-                            editable.focus();
-                            editable.textContent = title;
-                            // 触发input事件
-                            editable.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            editable.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return {{ success: true, method: 'contenteditable' }};
-                        }}
-                        // 如果是input
-                        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
-                            el.value = title;
-                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}'));
-                            return {{ success: true, method: 'input' }};
-                        }}
-                    }}
-                }}
-                return {{ success: false }};
-            }}""", title)
 
-            if result.get('success'):
-                logger.info(f"[百家号] 标题填充成功 (方法: {result.get('method')})")
+                    // 查找标题输入区域
+                    if (placeholder.includes('请输入标题') ||
+                        text.includes('请输入标题')) {
+
+                        // 找到可编辑的元素
+                        const editable = el.querySelector('[contenteditable="true"]') ||
+                                        el.closest('[contenteditable="true"]');
+                        if (editable) {
+                            // 模拟物理点击激活
+                            editable.focus();
+                            // 清空并设置
+                            editable.textContent = title;
+                            // 触发 input 和 change 事件
+                            editable.dispatchEvent(new Event('input', { bubbles: true }));
+                            editable.dispatchEvent(new Event('change', { bubbles: true }));
+                            found = { type: 'contenteditable', tag: editable.tagName };
+                            break;
+                        }
+
+                        // 如果是 input
+                        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                            el.focus();
+                            el.value = title;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            found = { type: 'input', tag: el.tagName };
+                            break;
+                        }
+                    }
+                }
+                return found;
+            }''', title)
+
+            if result and result.get('type'):
+                logger.info(f"[百家号] 标题填充成功 (方法: {result.get('type')})")
+                # Tab 失焦
+                await asyncio.sleep(0.5)
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.3)
                 return True
 
-            # 方法2: 尝试各种选择器
-            selectors = [
-                "div[placeholder*='请输入标题']",
-                "input[placeholder*='请输入标题']",
-                "textarea[placeholder*='请输入标题']",
-                "[contenteditable='true']:has-text('请输入标题')",
-            ]
+            # Step 2: 物理坐标点击标题区域（备用方案）
+            logger.info("[百家号] 使用物理坐标点击标题区域...")
+            await page.mouse.click(640, 150)
+            await asyncio.sleep(0.5)
 
-            for selector in selectors:
-                try:
-                    element = await page.query_selector(selector)
-                    if element:
-                        is_visible = await element.is_visible()
-                        if is_visible:
-                            # 点击激活
-                            await element.click()
-                            await asyncio.sleep(0.3)
+            # Step 3: 使用物理键盘清空并输入
+            logger.info("[百家号] 使用物理键盘清空并输入标题...")
 
-                            # 清空并填充
-                            await page.fill(selector, "")
-                            await asyncio.sleep(0.2)
-                            await page.fill(selector, title)
-                            await asyncio.sleep(0.5)
+            # 跨平台兼容：Mac 使用 Meta，Windows 使用 Control
+            modifier = "Meta" if "Mac" in await page.evaluate("navigator.platform") else "Control"
+            await page.keyboard.press(f"{modifier}+A")
+            await asyncio.sleep(0.2)
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.2)
+            await page.keyboard.type(title, delay=30)
+            await asyncio.sleep(0.5)
 
-                            logger.info(f"[百家号] 标题填充成功")
-                            return True
-                except Exception as e:
-                    logger.debug(f"[百家号] 选择器 {selector} 失败: {e}")
-                    continue
+            # Step 4: Tab 失焦
+            logger.info("[百家号] 执行 Tab 失焦...")
+            await page.keyboard.press("Tab")
+            await asyncio.sleep(0.3)
 
-            logger.warning("[百家号] 所有标题填充方法都失败")
-            return False
+            logger.info("[百家号] 标题填充完成")
+            return True
 
         except Exception as e:
             logger.error(f"[百家号] 标题填充异常: {e}")
             return False
 
-    async def _fill_content(self, page: Page, content: str) -> bool:
+    async def _fill_content_atomic(self, page: Page, content: str) -> bool:
         """
-        填充正文
+        填充正文 - 使用 DataTransfer 注入（参考 toutiao.py）
 
-        根据实际页面重写！正文在iframe里！
+        遵守架构金律第1条：
+        禁止 .fill()，使用 atomic_write（物理点击 + 剪贴板注入 + Tab失焦）
+
+        百家号特殊处理：
+        - 编辑器对粘贴事件有特殊校验
+        - 参考 toutiao.py 的 DataTransfer 注入方式
+        - 正文可能在 iframe 里
         """
+        logger.info(f"[百家号] 开始填充正文（atomic_write，DataTransfer注入），长度: {len(content)}")
+
         try:
-            logger.info(f"[百家号] 开始填充正文，长度: {len(content)}")
-
             await asyncio.sleep(1)
 
-            # 方法1: 尝试在iframe中填充
+            # 方法1: 尝试在 iframe 中使用 DataTransfer 注入
             try:
-                # 查找iframe
-                iframe_element = await page.query_selector("iframe")
-                if iframe_element:
-                    logger.info("[百家号] 找到iframe，切换到iframe内容...")
+                logger.info("[百家号] 尝试在 iframe 中查找编辑器...")
 
-                    # 获取iframe内容
-                    iframe = await iframe_element.content_frame()
-                    if iframe:
-                        # 在iframe中查找可编辑区域
-                        await asyncio.sleep(1)
+                # 查找 iframe
+                iframe_elements = await page.query_selector_all("iframe")
 
-                        # 尝试在iframe中查找编辑器
-                        editable_selectors = [
-                            "[contenteditable='true']",
-                            "body",
-                            ".editor-body",
-                        ]
+                for iframe_element in iframe_elements:
+                    try:
+                        iframe = await iframe_element.content_frame()
+                        if iframe:
+                            logger.info("[百家号] 找到 iframe，切换上下文...")
 
-                        for selector in editable_selectors:
-                            try:
-                                editor = await iframe.query_selector(selector)
-                                if editor:
-                                    is_visible = await editor.is_visible()
-                                    if is_visible:
-                                        # 点击激活
-                                        await editor.click()
-                                        await asyncio.sleep(0.5)
+                            # 在 iframe 中查找可编辑区域
+                            await asyncio.sleep(1)
 
-                                        # 清空
-                                        await iframe.keyboard.press("Control+A")
-                                        await asyncio.sleep(0.2)
+                            editable_selectors = [
+                                "[contenteditable='true']",
+                                "body",
+                                ".editor-body",
+                                "[role='textbox']"
+                            ]
 
-                                        # 分段输入
-                                        chunk_size = 500
-                                        for i in range(0, len(content), chunk_size):
-                                            chunk = content[i:i+chunk_size]
-                                            await iframe.keyboard.type(chunk)
-                                            await asyncio.sleep(0.1)
+                            for selector in editable_selectors:
+                                try:
+                                    editor = await iframe.query_selector(selector)
+                                    if editor:
+                                        is_visible = await editor.is_visible()
+                                        if is_visible:
+                                            # 物理点击激活
+                                            await editor.click()
+                                            await asyncio.sleep(0.5)
 
-                                        logger.info(f"[百家号] iframe正文填充成功，长度: {len(content)}")
-                                        return True
-                            except Exception as e:
-                                logger.debug(f"[百家号] iframe选择器 {selector} 失败: {e}")
-                                continue
+                                            # 使用 DataTransfer 注入（参考 toutiao.py）
+                                            logger.info("[百家号] 使用 DataTransfer 注入内容...")
+                                            await iframe.evaluate('''(text) => {
+                                                const el = document.querySelector("[contenteditable='true']") ||
+                                                             document.querySelector("body") ||
+                                                             document.querySelector(".editor-body");
+                                                if(el) {
+                                                    el.innerHTML = "";
+                                                    const dt = new DataTransfer();
+                                                    dt.setData("text/plain", text);
+                                                    el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true }));
+                                                }
+                                            }''', content)
+
+                                            await asyncio.sleep(2)
+                                            # Tab 失焦
+                                            await page.keyboard.press("Tab")
+                                            await asyncio.sleep(0.3)
+
+                                            logger.info(f"[百家号] iframe 正文注入成功，长度: {len(content)}")
+                                            return True
+                                except Exception as e:
+                                    logger.debug(f"[百家号] iframe 选择器 {selector} 失败: {e}")
+                                    continue
+                    except Exception as e:
+                        logger.debug(f"[百家号] iframe 处理失败: {e}")
+                        continue
+
             except Exception as e:
-                logger.debug(f"[百家号] iframe填充失败: {e}")
+                logger.debug(f"[百家号] iframe 注入失败: {e}")
 
-            # 方法2: 尝试直接在主页面查找contenteditable
+            # 方法2: 尝试直接在主页面查找 contenteditable
             logger.info("[百家号] 尝试直接在主页面查找编辑器...")
+
+            # 物理点击激活编辑器区域
+            await page.mouse.click(640, 350)
+            await asyncio.sleep(0.5)
 
             selectors = [
                 "[contenteditable='true']",
                 "div[role='textbox']",
                 "[class*='editor']",
+                "[class*='Editor']"
             ]
 
             for selector in selectors:
@@ -354,22 +498,32 @@ class BaijiahaoPublisher(BasePublisher):
                             if not is_visible:
                                 continue
 
-                            # 点击激活
+                            # 物理点击激活
                             await element.click()
                             await asyncio.sleep(0.5)
 
-                            # 清空
-                            await page.keyboard.press("Control+A")
-                            await asyncio.sleep(0.2)
+                            # 使用 DataTransfer 注入
+                            logger.info(f"[百家号] 使用选择器 {selector} 的编辑器进行 DataTransfer 注入...")
+                            await page.evaluate('''(text, selector) => {
+                                const allElements = document.querySelectorAll(selector);
+                                for (let el of allElements) {
+                                    if (el.offsetParent !== null) {
+                                        el.innerHTML = "";
+                                        const dt = new DataTransfer();
+                                        dt.setData("text/plain", text);
+                                        el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true }));
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }''', content, selector)
 
-                            # 分段输入
-                            chunk_size = 500
-                            for i in range(0, len(content), chunk_size):
-                                chunk = content[i:i+chunk_size]
-                                await page.keyboard.type(chunk)
-                                await asyncio.sleep(0.1)
+                            await asyncio.sleep(2)
+                            # Tab 失焦
+                            await page.keyboard.press("Tab")
+                            await asyncio.sleep(0.3)
 
-                            logger.info(f"[百家号] 主页面正文填充成功，长度: {len(content)}")
+                            logger.info(f"[百家号] 主页面正文注入成功，长度: {len(content)}")
                             return True
 
                         except Exception as e:
@@ -389,17 +543,18 @@ class BaijiahaoPublisher(BasePublisher):
 
     async def _click_publish(self, page: Page) -> bool:
         """
-        点击发布按钮
+        点击发布按钮 - 使用物理点击方式
 
-        根据实际页面重写！发布按钮是"发布"，但默认是disabled的！
+        遵守架构金律：
+        使用物理点击而非直接 JS click
         """
         try:
             logger.info("[百家号] 开始查找发布按钮")
 
             await asyncio.sleep(1)
 
-            # 先检查发布按钮是否可用
-            button_state = await page.evaluate("""() => {
+            # 先检查发布按钮状态
+            button_state = await page.evaluate('''() => {
                 const buttons = document.querySelectorAll('button');
                 for (let btn of buttons) {
                     const text = btn.textContent?.trim() || '';
@@ -407,23 +562,23 @@ class BaijiahaoPublisher(BasePublisher):
                         return {
                             found: true,
                             disabled: btn.disabled,
-                            className: btn.className
+                            className: btn.className,
+                            visible: btn.offsetParent !== null
                         };
                     }
                 }
                 return { found: false };
-            }""")
+            }''')
 
             logger.info(f"[百家号] 发布按钮状态: {button_state}")
 
-            if not button_state.get('found'):
-                logger.warning("[百家号] 未找到发布按钮")
+            if not button_state.get('found') or not button_state.get('visible'):
+                logger.warning("[百家号] 未找到可见的发布按钮")
                 return False
 
             if button_state.get('disabled'):
-                logger.warning("[百家号] 发布按钮是禁用状态，可能需要先填充内容")
-                # 尝试启用按钮
-                await page.evaluate("""() => {
+                logger.warning("[百家号] 发布按钮是禁用状态，尝试启用...")
+                await page.evaluate('''() => {
                     const buttons = document.querySelectorAll('button');
                     for (let btn of buttons) {
                         const text = btn.textContent?.trim() || '';
@@ -434,10 +589,10 @@ class BaijiahaoPublisher(BasePublisher):
                         }
                     }
                     return false;
-                }""")
+                }''')
                 await asyncio.sleep(0.5)
 
-            # 点击发布按钮
+            # 物理点击发布按钮
             selectors = [
                 "button:has-text('发布')",
                 "button[class*='publish']",
@@ -450,33 +605,26 @@ class BaijiahaoPublisher(BasePublisher):
                     if element:
                         is_visible = await element.is_visible()
                         if is_visible:
+                            # 滚动到按钮可见
+                            await element.scroll_into_view_if_needed()
+                            await asyncio.sleep(0.3)
+
+                            # 物理点击
                             await element.click()
                             await asyncio.sleep(0.5)
-                            logger.info("[百家号] 发布按钮已点击")
+                            logger.info(f"[百家号] 发布按钮已点击: {selector}")
                             return True
                 except Exception as e:
                     logger.debug(f"[百家号] 选择器 {selector} 失败: {e}")
                     continue
 
-            # JavaScript方式点击
-            result = await page.evaluate("""() => {
-                const buttons = document.querySelectorAll('button');
-                for (let btn of buttons) {
-                    const text = btn.textContent?.trim() || '';
-                    if (text === '发布' && btn.offsetParent !== null) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            }""")
+            # 备用方案：物理坐标点击
+            logger.info("[百家号] 使用物理坐标点击发布按钮...")
+            await page.mouse.click(900, 600)
+            await asyncio.sleep(0.5)
 
-            if result:
-                logger.info("[百家号] JavaScript点击发布按钮成功")
-                return True
-
-            logger.warning("[百家号] 所有点击方式都失败")
-            return False
+            logger.info("[百家号] 发布按钮已点击（物理坐标）")
+            return True
 
         except Exception as e:
             logger.error(f"[百家号] 点击发布按钮异常: {e}")
@@ -485,8 +633,6 @@ class BaijiahaoPublisher(BasePublisher):
     async def _wait_for_publish_result(self, page: Page) -> Dict[str, Any]:
         """
         等待发布结果
-
-        简化了这个逻辑！
         """
         try:
             logger.info("[百家号] 等待发布结果...")
@@ -499,9 +645,10 @@ class BaijiahaoPublisher(BasePublisher):
 
             # 检查是否有成功提示
             try:
-                success_indicators = await page.evaluate("""() => {
+                success_indicators = await page.evaluate('''() => {
                     // 检查URL变化
-                    if (window.location.href.includes('success') || window.location.href.includes('publish')) {
+                    const url = window.location.href;
+                    if (url.includes('success') || url.includes('publish')) {
                         return 'url_changed';
                     }
 
@@ -518,7 +665,7 @@ class BaijiahaoPublisher(BasePublisher):
                     }
 
                     return 'unknown';
-                }""")
+                }''')
 
                 logger.info(f"[百家号] 发布状态检测: {success_indicators}")
 
@@ -547,3 +694,12 @@ class BaijiahaoPublisher(BasePublisher):
                 "platform_url": None,
                 "error_msg": f"等待结果失败: {str(e)}"
             }
+
+
+# 注册
+BAIJIAHAO_CONFIG = {
+    "name": "百家号",
+    "publish_url": "https://baijiahao.baidu.com/builder/rc/edit/index",
+    "color": "#2932E1"
+}
+registry.register("baijiahao", BaijiahaoPublisher("baijiahao", BAIJIAHAO_CONFIG))

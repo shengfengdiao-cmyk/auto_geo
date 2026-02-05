@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Playwright浏览器管理器 - 工业级完整版
+Playwright浏览器管理器 - v5.0 指纹闭环版
 负责：浏览器生命周期、账号授权、自动化发布、用户名提取
 整合了浏览器管理和发布任务执行的基础设施
+
+v5.0 新增 - 指纹闭环：
+1. 从数据库 Account 表提取 user_agent 和 storage_state 注入浏览器上下文
+2. verify_session 私有方法：发布前访问平台首页，检查登录状态
+3. UA 绝对一致性：确保与授权时保存的 UA 完全一致
 """
 
 import asyncio
@@ -13,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError
 from loguru import logger
 from sqlalchemy.orm import Session
 
@@ -24,6 +29,11 @@ from backend.config import (
 from backend.services.crypto import encrypt_cookies, encrypt_storage_state, decrypt_cookies, decrypt_storage_state
 # 注意：这里我们只导入 registry，具体的发布器注册逻辑通常在应用启动时完成
 from backend.services.playwright.publishers.base import registry
+
+
+class AuthExpiredException(Exception):
+    """会话已过期异常"""
+    pass
 
 
 class AuthTask:
@@ -54,6 +64,8 @@ class PlaywrightManager:
     """
     Playwright 管理器 (单例模式)
     管理所有浏览器实例、授权任务和上下文
+
+    v5.0 新增：指纹闭环
     """
 
     def __init__(self):
@@ -153,6 +165,202 @@ class PlaywrightManager:
         self._is_running = False
         logger.info("🛑 Playwright 浏览器服务已停止")
 
+    # ==================== 指纹闭环相关 ====================
+
+    async def _verify_session(self, page: Page, platform: str) -> bool:
+        """
+        验证会话状态 - v5.1 增强版
+
+        验证方式：
+        1. 访问平台首页，检查是否出现登录按钮（UI 检查）
+        2. 针对知乎、搜狐、百家号增加"静默接口校验"（v5.1 新增）
+           - 知乎：检查 /me/api/v3/user/info 接口
+           - 百家号：检查登录状态接口
+           - 搜狐：检查登录状态接口
+
+        如果未登录，立即抛出 AuthExpiredException。
+
+        遵守架构金律第4条：指纹对齐
+        必须从数据库 Account 表提取 user_agent 和 storage_state 注入浏览器上下文
+
+        Args:
+            page: Playwright Page对象
+            platform: 平台ID
+
+        Returns:
+            是否已登录
+
+        Raises:
+            AuthExpiredException: 如果会话已过期
+        """
+        logger.info(f"[Fingerprint] 验证会话状态: {platform}")
+
+        try:
+            # 获取平台首页 URL
+            platform_config = PLATFORMS.get(platform)
+            if not platform_config:
+                logger.warning(f"[Fingerprint] 未找到平台配置: {platform}")
+                return False
+
+            home_url = platform_config.get("home_url") or platform_config.get("login_url")
+
+            # 访问平台首页
+            logger.info(f"[Fingerprint] 访问平台首页: {home_url}")
+            await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+
+            # ========== v5.1 新增：静默接口校验 ==========
+            api_check_passed = True
+            if platform == "zhihu":
+                api_check_passed = await self._zhihu_api_check(page)
+            elif platform == "baijiahao":
+                api_check_passed = await self._baijiahao_api_check(page)
+            elif platform == "sohu":
+                api_check_passed = await self._sohu_api_check(page)
+
+            if not api_check_passed:
+                logger.error(f"[Fingerprint] 静默接口校验失败，会话已过期: {platform}")
+                raise AuthExpiredException(f"平台 {platform} 静默接口校验失败，会话已过期")
+
+            # ========== UI 检查：是否出现登录按钮 ==========
+            has_login_button = await page.evaluate('''() => {
+                // 查找包含登录关键词的按钮
+                const loginSelectors = [
+                    'button:has-text("登录")',
+                    'button:has-text("Log in")',
+                    'button:has-text("Sign in")',
+                    'a[href*="login"]',
+                    'a[href*="signin"]',
+                    '[class*="login"]',
+                    '[id*="login"]'
+                ];
+
+                for (let selector of loginSelectors) {
+                    const elements = document.querySelectorAll(selector);
+                    for (let el of elements) {
+                        if (el.offsetParent !== null) {
+                            // 检查按钮文本
+                            const text = el.textContent?.trim().toLowerCase() || '';
+                            if (text.includes('登录') ||
+                                text.includes('login') ||
+                                text.includes('sign in')) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }''')
+
+            if has_login_button:
+                logger.error(f"[Fingerprint] 检测到登录按钮，会话已过期: {platform}")
+                raise AuthExpiredException(f"平台 {platform} 会话已过期，需要重新授权")
+
+            logger.info(f"[Fingerprint] 会话验证通过: {platform}")
+            return True
+
+        except AuthExpiredException:
+            raise
+        except Exception as e:
+            logger.warning(f"[Fingerprint] 会话验证异常: {e}")
+            # 验证失败不阻止发布，由发布器自行处理
+            return True
+
+    async def _zhihu_api_check(self, page: Page) -> bool:
+        """
+        知乎静默接口校验
+
+        通过检查 /me/api/v3/user/info 接口的响应状态来判断会话是否有效
+        """
+        try:
+            logger.info("[Fingerprint] 执行知乎静默接口校验...")
+            status = await page.evaluate('''
+                async () => {
+                    try {
+                        const response = await fetch('/me/api/v3/user/info', {
+                            method: 'GET',
+                            credentials: 'include'
+                        });
+                        return response.status;
+                    } catch (e) {
+                        return 999; // 网络错误
+                    }
+                }
+            ''')
+            logger.info(f"[Fingerprint] 知乎接口响应状态: {status}")
+
+            if status in [401, 403]:
+                logger.warning(f"[Fingerprint] 知乎接口返回 {status}，会话已过期")
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"[Fingerprint] 知乎接口校验异常: {e}")
+            return True  # 校验失败不阻止，继续执行
+
+    async def _baijiahao_api_check(self, page: Page) -> bool:
+        """
+        百家号静默接口校验
+
+        通过检查用户信息接口的响应状态来判断会话是否有效
+        """
+        try:
+            logger.info("[Fingerprint] 执行百家号静默接口校验...")
+            status = await page.evaluate('''
+                async () => {
+                    try {
+                        // 尝试访问用户信息接口
+                        const response = await fetch('/authorpc/api/user/info', {
+                            method: 'GET',
+                            credentials: 'include'
+                        });
+                        return response.status;
+                    } catch (e) {
+                        return 999; // 网络错误
+                    }
+                }
+            ''')
+            logger.info(f"[Fingerprint] 百家号接口响应状态: {status}")
+
+            if status in [401, 403]:
+                logger.warning(f"[Fingerprint] 百家号接口返回 {status}，会话已过期")
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"[Fingerprint] 百家号接口校验异常: {e}")
+            return True  # 校验失败不阻止，继续执行
+
+    async def _sohu_api_check(self, page: Page) -> bool:
+        """
+        搜狐静默接口校验
+
+        通过检查用户信息接口的响应状态来判断会话是否有效
+        """
+        try:
+            logger.info("[Fingerprint] 执行搜狐静默接口校验...")
+            status = await page.evaluate('''
+                async () => {
+                    try {
+                        // 尝试访问用户信息接口
+                        const response = await fetch('/api/user/info', {
+                            method: 'GET',
+                            credentials: 'include'
+                        });
+                        return response.status;
+                    } catch (e) {
+                        return 999; // 网络错误
+                    }
+                }
+            ''')
+            logger.info(f"[Fingerprint] 搜狐接口响应状态: {status}")
+
+            if status in [401, 403]:
+                logger.warning(f"[Fingerprint] 搜狐接口返回 {status}，会话已过期")
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"[Fingerprint] 搜狐接口校验异常: {e}")
+            return True  # 校验失败不阻止，继续执行
+
     # ==================== 授权相关 ====================
 
     async def create_auth_task(
@@ -163,6 +371,8 @@ class PlaywrightManager:
     ) -> AuthTask:
         """
         创建授权任务：启动浏览器，打开登录页，注入JS桥接
+
+        v5.0 增强：保存 user_agent 到数据库
         """
         logger.info(f"[Auth] 开始创建授权任务: platform={platform}, account_id={account_id}")
 
@@ -176,17 +386,20 @@ class PlaywrightManager:
 
         platform_config = PLATFORMS[platform]
 
-        # 创建浏览器上下文
+        # 标准化 User-Agent（确保与后续发布时一致）
+        standard_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        # 创建浏览器上下文（使用标准 UA）
         context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent=standard_ua
         )
         task.context = context
 
         # 注入 JS 桥接函数：供前端控制页调用
         async def confirm_auth_wrapper(task_id_from_browser: str) -> str:
             """浏览器调用的确认授权函数"""
-            return await self._finalize_auth(task_id_from_browser)
+            return await self._finalize_auth(task_id_from_browser, standard_ua)
 
         await context.expose_function("confirmAuth", confirm_auth_wrapper)
         logger.info(f"[Auth] confirmAuth 函数已注入")
@@ -204,8 +417,6 @@ class PlaywrightManager:
         # 兼容性处理：如果找不到文件，使用内置HTML
         if not control_page_path.exists():
             logger.warning(f"控制页模板未找到: {control_page_path}")
-            # 这里可以考虑写入一个临时文件或者直接用 data:text/html
-            # 为了简单，我们假设文件存在。实际部署时请确保 backend/static/auth_confirm.html 存在。
 
         control_page_url = f"file:///{control_page_path.as_posix()}?task_id={task.task_id}&platform={platform}"
         control_page = await context.new_page()
@@ -219,9 +430,16 @@ class PlaywrightManager:
 
         return task
 
-    async def _finalize_auth(self, task_id: str) -> str:
+    async def _finalize_auth(self, task_id: str, user_agent: str) -> str:
         """
         核心：提取登录凭证并入库
+
+        v5.0 增强：保存 user_agent 到数据库，确保指纹一致性
+
+        v5.1 修复：使用 context.storage_state() 获取标准格式的 StorageState
+        - 不再手动拼接 localStorage 字典
+        - 直接调用 Playwright 标准 API 获取包含 Cookies 和 LocalStorage 的完整状态
+        - 这样存储的格式与 browser.new_context(storage_state=...) 完全兼容
         """
         task = self._auth_tasks.get(task_id)
         if not task:
@@ -230,10 +448,13 @@ class PlaywrightManager:
         logger.info(f"[Auth] 收到确认信号: {task_id}")
 
         try:
-            # 1. 提取 Cookies 和 Storage
-            cookies = await task.context.cookies()
-            storage_state = await task.page.evaluate(
-                "() => ({ localStorage: {...localStorage}, sessionStorage: {...sessionStorage} })") or {}
+            # 1. 提取标准格式的 StorageState (v5.1 修复)
+            # 直接使用 context.storage_state() 获取 Playwright 标准格式
+            # 返回格式: {"cookies": [...], "origins": [{"origin": "https://...", "localStorage": [...]}]}
+            storage_state = await task.context.storage_state()
+            cookies = storage_state.get("cookies", [])
+
+            logger.info(f"[Auth] StorageState 提取完成: {len(cookies)} cookies, {len(storage_state.get('origins', []))} origins")
 
             # 2. 基础验证
             # 针对不同平台的关键 Cookie 检查
@@ -269,10 +490,11 @@ class PlaywrightManager:
                         account.cookies = enc_cookies
                         account.storage_state = enc_storage
                         account.username = username or account.username
+                        account.user_agent = user_agent  # v5.0 新增：保存 UA
                         account.status = 1
                         account.last_auth_time = datetime.now()
                         db.commit()
-                        logger.success(f"[Auth] 账号 {account.account_name} 更新成功")
+                        logger.success(f"[Auth] 账号 {account.account_name} 更新成功 (UA 已保存)")
                 else:
                     # 新增
                     name = task.account_name or f"{PLATFORMS[task.platform]['name']}_{username or 'User'}"
@@ -282,6 +504,7 @@ class PlaywrightManager:
                         username=username,
                         cookies=enc_cookies,
                         storage_state=enc_storage,
+                        user_agent=user_agent,  # v5.0 新增：保存 UA
                         status=1,
                         last_auth_time=datetime.now()
                     )
@@ -289,7 +512,7 @@ class PlaywrightManager:
                     db.commit()
                     db.refresh(account)
                     task.created_account_id = account.id
-                    logger.success(f"[Auth] 新账号 {name} 创建成功")
+                    logger.success(f"[Auth] 新账号 {name} 创建成功 (UA 已保存)")
 
                 task.status = "success"
 
@@ -362,7 +585,29 @@ class PlaywrightManager:
     async def execute_publish(self, article: Any, account: Any) -> Dict[str, Any]:
         """
         供 Service 调用的发布执行入口 (核心)
+
+        v5.0 增强：
+        1. 从数据库 Account 表提取 user_agent 注入浏览器上下文
+        2. 发布前调用 verify_session 验证登录状态
+        3. 确保 UA 绝对一致性
+
+        v5.1 修复：
+        1. 修复 StorageState 注入流程：确保解密出的 JSON 直接作为 browser.new_context 的参数
+        2. 增加 UA 注入安全性检查日志
+
+        v6.0 首席架构师修复：
+        1. 反检测抹除：context.add_init_script() 彻底抹除 navigator.webdriver 特征
+        2. 指纹校验：UA 为空时拒绝执行
         """
+        # ========== v6.0 新增：指纹校验 - UA 为空时拒绝执行 ==========
+        stored_user_agent = getattr(account, 'user_agent', None)
+        if not stored_user_agent:
+            logger.error(f"[Fingerprint] ❌ 账号 {account.account_name} 缺少 user_agent，拒绝执行发布")
+            return {"success": False, "error_msg": "账号缺少 user_agent，请先完成授权流程"}
+
+        # 打印当前数据库存储的 UA
+        logger.info(f"[Fingerprint] ✓ 账号 {account.account_name} 数据库 UA: {stored_user_agent[:60] if stored_user_agent else 'None'}...")
+
         await self.start()
 
         # 动态获取发布器
@@ -373,27 +618,133 @@ class PlaywrightManager:
         # 准备上下文
         context = None
         try:
-            # 解密 Session
-            state_data = {}
+            # ========== v5.1 修复：解密并注入标准格式的 StorageState ==========
+            state_data = None
             if account.storage_state:
                 try:
                     decrypted = decrypt_storage_state(account.storage_state)
-                    state_data = decrypted if decrypted else json.loads(account.storage_state)
-                except:
-                    logger.warning(f"账号 {account.account_name} Session 解析失败，尝试裸奔")
+                    if decrypted:
+                        state_data = decrypted
+                        logger.info(f"[Fingerprint] StorageState 解密成功: {len(decrypted.get('cookies', []))} cookies, {len(decrypted.get('origins', []))} origins")
+                    else:
+                        logger.warning(f"[Fingerprint] 账号 {account.account_name} StorageState 解密结果为空")
+                except Exception as e:
+                    logger.warning(f"[Fingerprint] 账号 {account.account_name} StorageState 解密失败: {e}，尝试裸奔")
+
+            # ========== v5.1 新增：UA 注入安全性检查 ==========
+            # 从数据库提取 user_agent（指纹对齐），确保与授权时保存的 UA 完全一致
+            stored_user_agent = getattr(account, 'user_agent', None)
+            if not stored_user_agent:
+                logger.warning(f"[Fingerprint] 账号 {account.account_name} 缺少 user_agent，使用默认 UA")
+
+            # 定义标准 UA（与授权时一致）
+            standard_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent = stored_user_agent or standard_ua
+
+            # UA 注入安全性日志：检查 UA 是否匹配
+            if stored_user_agent:
+                if stored_user_agent == standard_ua:
+                    logger.info(f"[Fingerprint] ✓ UA 注入验证通过：数据库 UA 与标准 UA 一致")
+                    logger.info(f"[Fingerprint] 注入 UA: {user_agent[:60]}...")
+                else:
+                    logger.warning(f"[Fingerprint] ⚠ UA 不匹配告警：数据库 UA 与标准 UA 不一致")
+                    logger.warning(f"[Fingerprint] 数据库 UA: {stored_user_agent[:60]}...")
+                    logger.warning(f"[Fingerprint] 标准 UA: {standard_ua[:60]}...")
+                    logger.warning(f"[Fingerprint] 注入 UA: {user_agent[:60]}...")
+            else:
+                logger.info(f"[Fingerprint] 使用默认 UA: {user_agent[:60]}...")
+
+            # 创建浏览器上下文（注入标准格式的 storage_state 和 user_agent）
+            # v5.1 修复：确保 state_data 是符合 Playwright 标准的 Dict 格式
+            # 这样 Playwright 会自动处理跨域的 localStorage 恢复
+
+            # ========== v6.0 首席架构师修复：Session 拯救（反检测抹除）==========
+            # 彻底抹除 navigator.webdriver 特征，避免被反爬虫系统识别
+            anti_detection_script = '''
+                // 覆盖 navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                    configurable: true
+                });
+
+                // 覆盖 Chrome 对象的检测
+                Object.defineProperty(window, 'chrome', {
+                    get: () => undefined,
+                    configurable: true
+                });
+
+                // 覆盖权限查询
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = () => Promise.resolve({ state: 'granted', onchange: null });
+
+                // 覆盖 plugins 长度
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                    configurable: true
+                });
+
+                // 覆盖 languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                    configurable: true
+                });
+            '''
 
             context = await self._browser.new_context(
                 storage_state=state_data if state_data else None,
+                user_agent=user_agent,
                 viewport={"width": 1280, "height": 800}
             )
 
+            # 注入反检测抹除脚本
+            await context.add_init_script(anti_detection_script)
+            logger.info("[Fingerprint] 已注入反检测抹除脚本")
+
             page = await context.new_page()
+
+            # v6.0 新增：预警截图机制
+            async def take_failure_screenshot(reason: str):
+                """捕获失败截图"""
+                try:
+                    import os
+                    logs_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+                    os.makedirs(logs_dir, exist_ok=True)
+                    screenshot_path = os.path.join(logs_dir, f"fail_{account.platform}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png")
+                    await page.screenshot(path=screenshot_path, full_page=True)
+                    logger.info(f"[Fingerprint] 预警截图已保存: {screenshot_path} (原因: {reason})")
+                except Exception as e:
+                    logger.error(f"[Fingerprint] 截图失败: {e}")
+
+            # v5.0 新增：验证会话状态（带截图）
+            logger.info("[Fingerprint] 开始验证会话状态...")
+            try:
+                await self._verify_session(page, account.platform)
+            except AuthExpiredException as e:
+                logger.error(f"[Fingerprint] 会话验证失败: {e}")
+                await take_failure_screenshot("会话过期")
+                return {"success": False, "error_msg": str(e)}
+            except Exception as e:
+                logger.error(f"[Fingerprint] 会话验证异常: {e}")
+                await take_failure_screenshot(f"验证异常: {e}")
+                return {"success": False, "error_msg": str(e)}
 
             # 执行发布逻辑
             logger.info(f"🚀 [Publish] 开始执行发布: {account.platform} - {article.title}")
-            result = await publisher.publish(page, article, account)
-
-            return result
+            try:
+                result = await publisher.publish(page, article, account)
+                return result
+            except TimeoutError as e:
+                logger.error(f"[Publish] 超时错误: {e}")
+                await take_failure_screenshot(f"超时: {e}")
+                return {"success": False, "error_msg": f"操作超时: {str(e)}"}
+            except AuthExpiredException as e:
+                logger.error(f"[Publish] 认证失败: {e}")
+                await take_failure_screenshot(f"认证失败: {e}")
+                return {"success": False, "error_msg": f"认证失败: {str(e)}"}
+            except Exception as e:
+                logger.exception(f"[Publish] 执行异常: {e}")
+                await take_failure_screenshot(f"发布异常: {e}")
+                return {"success": False, "error_msg": str(e)}
 
         except Exception as e:
             logger.exception(f"❌ [Publish] 执行异常: {e}")
